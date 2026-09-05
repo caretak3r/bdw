@@ -27,11 +27,28 @@ const ACTOR_COLORS: [Color; 6] = [
 
 /// Stable actor→color hash: `DefaultHasher::new()` uses fixed keys (not
 /// randomized per-process), so the same actor name always lands on the same
-/// color, run to run.
+/// color, run to run. Always hashes the full raw actor string, even where
+/// the display label is shortened, so identity stays stable.
 fn actor_color(actor: &Actor) -> Color {
     let mut hasher = DefaultHasher::new();
     actor.0.hash(&mut hasher);
     ACTOR_COLORS[(hasher.finish() % ACTOR_COLORS.len() as u64) as usize]
+}
+
+/// Compact display label for an actor: cuts at the first `+` or `@` (covers
+/// GitHub noreply addresses like `50377477+caretak3r@users.noreply.github.com`
+/// → `50377477`), else hard-truncates at a char boundary so the board/feed
+/// panes stay narrow. Detail views should show `actor.0` in full instead.
+pub(crate) fn short_name(actor: &Actor) -> &str {
+    let raw = actor.0.as_str();
+    if let Some(idx) = raw.find(['+', '@']) {
+        return &raw[..idx];
+    }
+    const MAX: usize = 24;
+    match raw.char_indices().nth(MAX) {
+        Some((byte_idx, _)) => &raw[..byte_idx],
+        None => raw,
+    }
 }
 
 fn fmt_age(seconds: i64) -> String {
@@ -57,22 +74,26 @@ pub(crate) fn draw_actors(f: &mut Frame, area: Rect, app: &App) {
         }
         let age = (now - *last_seen).num_seconds();
         let live = age < 120;
+        let selected = app.actor_filter.as_ref() == Some(actor);
         let dot_color = if live {
             actor_color(actor)
         } else {
             colors::DIM
         };
-        let name_style = if live {
+        let mut name_style = if live {
             Style::default().fg(colors::FG)
         } else {
             Style::default().fg(colors::DIM)
         };
+        if selected {
+            name_style = name_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+        }
         spans.push(Span::styled(
             if live { "●" } else { "○" },
             Style::default().fg(dot_color),
         ));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(actor.0.clone(), name_style));
+        spans.push(Span::styled(short_name(actor).to_string(), name_style));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             fmt_age(age),
@@ -83,7 +104,14 @@ pub(crate) fn draw_actors(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(colors::BORDER))
-        .title(" ACTORS ");
+        .title(" ACTORS ")
+        .title_top(
+            Line::from(Span::styled(
+                "[a]ctor filter",
+                Style::default().fg(colors::DIMMER),
+            ))
+            .right_aligned(),
+        );
     f.render_widget(
         Paragraph::new(Line::from(spans))
             .block(block)
@@ -92,7 +120,7 @@ pub(crate) fn draw_actors(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn status_label(status: &Status) -> &str {
+pub(crate) fn status_label(status: &Status) -> &str {
     match status {
         Status::Open => "open",
         Status::InProgress => "in_progress",
@@ -107,7 +135,7 @@ fn fmt_prio(p: Option<i32>) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-fn change_label(change: &Change) -> String {
+pub(crate) fn change_label(change: &Change) -> String {
     match change {
         Change::Created => "created".to_string(),
         Change::StatusChanged { old, new } => {
@@ -130,7 +158,7 @@ fn event_lines(event: &FeedEvent, now: DateTime<Utc>) -> Vec<Line<'static>> {
     let actor_name = event
         .actor
         .as_ref()
-        .map(|a| a.0.clone())
+        .map(|a| short_name(a).to_string())
         .unwrap_or_else(|| "derived".to_string());
     let actor_style = match &event.actor {
         Some(actor) => Style::default().fg(actor_color(actor)),
@@ -175,15 +203,26 @@ fn event_lines(event: &FeedEvent, now: DateTime<Utc>) -> Vec<Line<'static>> {
 pub(crate) fn draw_events(f: &mut Frame, area: Rect, app: &App) {
     let now = Utc::now();
     let mut lines = Vec::new();
-    for event in &app.feed {
+    for event in app.feed.iter().filter(|e| matches_actor_filter(e, app)) {
         lines.extend(event_lines(event, now));
     }
 
+    let title = match &app.actor_filter {
+        Some(actor) => format!(" LIVE EVENTS · {} ", short_name(actor)),
+        None => " LIVE EVENTS ".to_string(),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(colors::BORDER))
-        .title(" LIVE EVENTS ");
+        .title(title);
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn matches_actor_filter(event: &FeedEvent, app: &App) -> bool {
+    match &app.actor_filter {
+        None => true,
+        Some(filter) => event.actor.as_ref() == Some(filter),
+    }
 }
 
 #[cfg(test)]

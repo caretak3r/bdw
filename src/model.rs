@@ -1,10 +1,4 @@
 //! Data types shared by the bd sources and (in later phases) the app/UI.
-//!
-//! Several fields here (titles, descriptions, dependency counts, notes...)
-//! are populated now but only read starting in Phase 2/3's board and detail
-//! views, so this module carries its own dead-code allowance rather than
-//! having every unused-field warning fought individually.
-#![allow(dead_code)]
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer};
@@ -48,16 +42,23 @@ impl<'de> Deserialize<'de> for Status {
     }
 }
 
-/// One `dependencies[]` element from `bd list --all --flat --json`.
+/// One `dependencies[]` element from `bd list --all --flat --json`. Only
+/// `depends_on_id`/`dep_type` drive `is_blocked`; the rest is parsed for
+/// schema completeness and stays unread until a dependency-detail view needs
+/// "who added this link and when."
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Dependency {
+    #[allow(dead_code)]
     pub(crate) issue_id: String,
     pub(crate) depends_on_id: String,
     #[serde(rename = "type")]
     pub(crate) dep_type: String,
+    #[allow(dead_code)]
     pub(crate) created_at: Option<DateTime<Utc>>,
+    #[allow(dead_code)]
     pub(crate) created_by: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub(crate) metadata: String,
 }
 
@@ -91,7 +92,9 @@ pub(crate) struct Issue {
     pub(crate) dependency_count: u32,
     #[serde(default)]
     pub(crate) dependent_count: u32,
+    // No comment-count badge anywhere yet; kept parsed for when one lands.
     #[serde(default)]
+    #[allow(dead_code)]
     pub(crate) comment_count: u32,
     #[serde(default)]
     pub(crate) notes: Option<String>,
@@ -119,11 +122,16 @@ pub(crate) struct Counts {
     pub(crate) ready_issues: u32,
     #[serde(default)]
     pub(crate) total_issues: u32,
+    // No header widget surfaces these three yet; kept parsed since they're
+    // free on the wire and a future stats panel will want them.
     #[serde(default)]
+    #[allow(dead_code)]
     pub(crate) pinned_issues: u32,
     #[serde(default)]
+    #[allow(dead_code)]
     pub(crate) epics_eligible_for_closure: u32,
     #[serde(default)]
+    #[allow(dead_code)]
     pub(crate) average_lead_time_hours: f64,
 }
 
@@ -132,6 +140,9 @@ pub(crate) struct Counts {
 /// Parse `kind` as a plain string so an unknown value never fails parsing.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AuditEvent {
+    // Only used for schema completeness / potential future dedup; the feed
+    // keys off `(issue_id, timestamp)`, not this id.
+    #[allow(dead_code)]
     pub(crate) id: String,
     pub(crate) kind: String,
     pub(crate) created_at: DateTime<Utc>,

@@ -14,7 +14,7 @@ use crossterm::event::{Event, KeyEventKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use app::{key_to_action, App, RefreshOutcome};
+use app::{App, RefreshOutcome};
 use source::bd::BdClient;
 use source::events::{audit_to_feed_event, diff_snapshots, Tailer};
 
@@ -183,9 +183,7 @@ async fn app_loop(terminal: &mut Term, mut app: App, root: PathBuf) -> Result<()
             Some(event) = input_rx.recv() => {
                 if let Event::Key(key) = event {
                     if key.kind == KeyEventKind::Press {
-                        if let Some(action) = key_to_action(key.code) {
-                            app.apply_action(action);
-                        }
+                        app.handle_key(key.code);
                     }
                 }
             }

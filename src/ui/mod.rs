@@ -3,6 +3,7 @@
 //! and the two single-line chrome bars, plus the shared color palette.
 
 pub(crate) mod board;
+pub(crate) mod detail;
 pub(crate) mod feed;
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -11,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, Mode};
 
 /// Colors lifted from `docs/tui-mock.html`'s CSS variables so the TUI reads
 /// as the same palette in a real terminal.
@@ -62,6 +63,10 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
     feed::draw_events(f, main[1], app);
 
     draw_footer(f, outer[2]);
+
+    if app.mode == Mode::Detail {
+        detail::draw(f, f.area(), app);
+    }
 }
 
 /// One bordered row of actors, growing by a row for every ~4 actors so a
@@ -139,9 +144,19 @@ fn draw_footer(f: &mut Frame, area: Rect) {
     let key_style = Style::default().fg(colors::DIM);
     let line = Line::from(vec![
         Span::styled("↑↓/jk", key_style),
-        Span::raw(" select   "),
+        Span::raw(" select  "),
+        Span::styled("⏎", key_style),
+        Span::raw(" detail  "),
+        Span::styled("esc", key_style),
+        Span::raw(" close/clear  "),
+        Span::styled("e/s", key_style),
+        Span::raw(" epic/status  "),
+        Span::styled("/", key_style),
+        Span::raw(" search  "),
+        Span::styled("a", key_style),
+        Span::raw(" actor  "),
         Span::styled("g/G", key_style),
-        Span::raw(" top/bottom   "),
+        Span::raw(" top/bottom  "),
         Span::styled("q", key_style),
         Span::raw(" quit"),
     ]);
@@ -153,4 +168,53 @@ fn draw_footer(f: &mut Frame, area: Rect) {
     )))
     .alignment(Alignment::Right);
     f.render_widget(ro, chunks[1]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::RefreshOutcome;
+    use crate::model::{Counts, Issue};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+
+    fn issue(id: &str, status: &str) -> Issue {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "status": status,
+            "title": "Fix the thing",
+        }))
+        .unwrap()
+    }
+
+    /// Headless render smoke test: the project currently has no other gate
+    /// that catches a `draw` panic (bad `Rect` split, out-of-range slice,
+    /// ...), so this is the one check that actually calls it.
+    #[test]
+    fn draw_renders_project_name_bucket_label_and_glyph() {
+        let mut app = App::new(PathBuf::from("/tmp"), "voltrol".into());
+        app.apply_refresh(RefreshOutcome {
+            issues: vec![issue("v-1", "open")],
+            counts: Counts::default(),
+            events: Vec::new(),
+            malformed: 0,
+            at: chrono::Utc::now(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(rendered.contains("voltrol"));
+        assert!(rendered.contains("OPEN"));
+        assert!(rendered.contains('○'));
+    }
 }
