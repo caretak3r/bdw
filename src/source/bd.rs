@@ -50,7 +50,10 @@ impl BdClient {
             .arg("-C")
             .arg(&self.root)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Without this, a timed-out bd process outlives the dropped
+            // wait_with_output() future and leaks until it exits on its own.
+            .kill_on_drop(true);
         let child = command.spawn()?;
 
         let output = match tokio::time::timeout(TIMEOUT, child.wait_with_output()).await {
