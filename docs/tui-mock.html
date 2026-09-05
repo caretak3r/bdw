@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>bdw — beads watch TUI mock (voltrol)</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --screen: #0d1117;
+    --fg: #c9d1d9;
+    --dim: #6e7681;
+    --dimmer: #484f58;
+    --border: #30363d;
+    --border-focus: #58a6ff;
+    --sel: #1c2a3a;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --orange: #db6d28;
+    --cyan: #39c5cf;
+    --blue: #58a6ff;
+    --magenta: #bc8cff;
+    --pink: #ff7b72;
+    --mono: "SF Mono", "JetBrains Mono", Menlo, Monaco, "Cascadia Code", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg);
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px 16px; font-family: var(--mono);
+  }
+  .term {
+    width: 100%; max-width: 1180px; background: #161b22;
+    border-radius: 10px; overflow: hidden; min-width: 0;
+    box-shadow: 0 24px 80px rgba(0,0,0,.6), 0 0 0 1px #000;
+  }
+  .chrome {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px; background: #1c2128; border-bottom: 1px solid #000;
+  }
+  .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .dot.r { background: #ff5f57; } .dot.y { background: #febc2e; } .dot.g { background: #28c840; }
+  .chrome-title {
+    flex: 1; text-align: center; color: var(--dim); font-size: 12px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+  }
+  .screen {
+    background: var(--screen); padding: 10px 12px; font-size: 13px; line-height: 1.5;
+    display: grid; grid-template-rows: auto minmax(0,1fr) auto;
+    gap: 6px; height: 660px; color: var(--fg);
+  }
+
+  /* ── header ── */
+  .hdr {
+    display: flex; gap: 18px; align-items: baseline; padding: 2px 6px;
+    white-space: nowrap; overflow: hidden; min-width: 0;
+  }
+  .hdr .proj { color: var(--fg); font-weight: 700; }
+  .hdr .meta { color: var(--dim); }
+  .hdr .spacer { flex: 1; }
+  .hdr .upd { color: var(--dimmer); }
+  .hdr .upd.fresh { color: var(--green); }
+  .st-open { color: var(--fg); } .st-wip { color: var(--yellow); }
+  .st-blk { color: var(--cyan); } .st-done { color: var(--green); }
+
+  /* ── main grid ── */
+  .main {
+    display: grid; grid-template-columns: minmax(0, 46fr) minmax(0, 54fr);
+    gap: 8px; min-height: 0;
+  }
+  .col-l { display: grid; grid-template-rows: minmax(0,1fr) auto; gap: 8px; min-height: 0; min-width: 0; }
+
+  .pane {
+    border: 1px solid var(--border); border-radius: 4px; position: relative;
+    padding: 12px 0 6px; min-height: 0; min-width: 0; display: flex; flex-direction: column;
+  }
+  .pane.focused { border-color: var(--border-focus); }
+  .pane-title {
+    position: absolute; top: -9px; left: 10px; background: var(--screen);
+    padding: 0 6px; color: var(--dim); font-size: 11px; letter-spacing: .08em;
+  }
+  .pane.focused .pane-title { color: var(--border-focus); }
+  .pane-hint { position: absolute; top: -9px; right: 10px; background: var(--screen); padding: 0 6px; color: var(--dimmer); font-size: 11px; }
+  .pane-body { overflow-y: auto; min-height: 0; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+  /* ── tasks ── */
+  .grp {
+    color: var(--dimmer); padding: 3px 10px 1px; font-size: 12px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .grp .gid { color: var(--magenta); }
+  .row {
+    display: flex; gap: 8px; align-items: baseline; padding: 1px 10px 1px 10px;
+    white-space: nowrap; overflow: hidden; min-width: 0; cursor: pointer;
+  }
+  .row.child { padding-left: 26px; }
+  .row.selected { background: var(--sel); }
+  .row.selected::before { content: ""; position: absolute; }
+  .row .glyph { width: 14px; flex: none; }
+  .row .id { color: var(--dim); flex: none; }
+  .row .title { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1; }
+  .row .prio { flex: none; font-size: 12px; }
+  .row.stale .title, .row.stale .id { color: var(--dimmer); }
+  .row.done .title { color: var(--dim); text-decoration: line-through; text-decoration-color: var(--dimmer); }
+  .g-open { color: var(--fg); } .g-wip { color: var(--yellow); }
+  .g-blk { color: var(--cyan); } .g-done { color: var(--green); }
+  .p0 { color: var(--red); } .p1 { color: var(--orange); } .p2 { color: var(--dim); } .p3 { color: var(--dimmer); }
+  .row.flash { animation: rowflash 1.6s ease-out; }
+  @keyframes rowflash { 0% { background: #2d333b; } 100% { background: transparent; } }
+
+  .searchbar { display: none; padding: 2px 10px; color: var(--yellow); }
+  .searchbar.on { display: block; }
+  .searchbar input {
+    background: transparent; border: none; outline: none; color: var(--fg);
+    font-family: var(--mono); font-size: 13px; width: 70%;
+  }
+
+  /* ── actors ── */
+  .actors { padding: 12px 10px 8px; }
+  .actor-line { display: flex; flex-wrap: wrap; gap: 4px 18px; min-width: 0; }
+  .actor { white-space: nowrap; }
+  .actor .age { color: var(--dimmer); }
+  .a-live { }
+  .a-idle { color: var(--dim); }
+
+  /* ── events ── */
+  .ev { padding: 2px 12px 3px; border-left: 2px solid transparent; min-width: 0; }
+  .ev.flash { animation: rowflash 1.6s ease-out; }
+  .ev .l1 { display: flex; gap: 10px; white-space: nowrap; overflow: hidden; min-width: 0; }
+  .ev .t { color: var(--dimmer); flex: none; }
+  .ev .actor-n { flex: none; font-weight: 600; }
+  .ev .iid { color: var(--dim); overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .ev .l2 { color: var(--fg); padding-left: 76px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ev .l3 {
+    color: var(--dim); font-style: italic; padding-left: 76px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .ev .arr { color: var(--dimmer); }
+  .ev .k-closed { color: var(--green); } .ev .k-open { color: var(--fg); }
+  .ev .k-wip { color: var(--yellow); } .ev .k-created { color: var(--blue); }
+  .ev .k-derived { color: var(--dimmer); font-style: italic; }
+  .ac-1 { color: var(--cyan); } .ac-2 { color: var(--magenta); }
+  .ac-3 { color: var(--green); } .ac-0 { color: var(--blue); }
+  .ac-d { color: var(--dimmer); }
+
+  /* ── footer ── */
+  .keys {
+    display: flex; gap: 16px; color: var(--dimmer); font-size: 12px;
+    padding: 2px 6px; white-space: nowrap; overflow: hidden;
+  }
+  .keys b { color: var(--dim); font-weight: 600; }
+  .keys .spacer { flex: 1; }
+  .keys .ro { color: var(--dimmer); }
+
+  /* ── detail overlay ── */
+  .overlay {
+    display: none; position: absolute; inset: 0; background: rgba(5,8,12,.72);
+    align-items: center; justify-content: center; z-index: 10;
+  }
+  .overlay.on { display: flex; }
+  .detail {
+    width: min(720px, 92%); max-height: 82%; background: var(--screen);
+    border: 1px solid var(--border-focus); border-radius: 4px; position: relative;
+    padding: 16px 0 8px; display: flex; flex-direction: column; min-width: 0;
+  }
+  .detail .pane-title { color: var(--border-focus); }
+  .detail-body { overflow-y: auto; padding: 0 16px 8px; min-height: 0; font-size: 13px; }
+  .detail-body h3 { margin: 4px 0 2px; font-size: 13px; color: var(--fg); font-weight: 700; }
+  .kv { display: flex; gap: 14px; flex-wrap: wrap; color: var(--dim); margin-bottom: 8px; }
+  .kv b { color: var(--fg); font-weight: 600; }
+  .desc { color: var(--fg); white-space: pre-wrap; word-break: break-word; margin: 6px 0 10px; }
+  .desc .verbatim { color: var(--yellow); }
+  .hist-h { color: var(--dimmer); font-size: 11px; letter-spacing: .08em; margin: 10px 0 4px; }
+  .hist { color: var(--dim); }
+  .hist div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .term-wrap { position: relative; }
+</style>
+</head>
+<body>
+<div class="term">
+  <div class="chrome">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="chrome-title">bdw — /Users/rohit/Documents/voltrol — 132×38</span>
+  </div>
+  <div class="term-wrap">
+  <div class="screen">
+
+    <!-- header -->
+    <div class="hdr">
+      <span class="proj">voltrol</span>
+      <span class="meta">dolt · <span id="total">84</span> issues</span>
+      <span class="st-open">○ <span id="c-open">30</span> open</span>
+      <span class="st-wip">◐ <span id="c-wip">3</span> wip</span>
+      <span class="st-blk">❄ <span id="c-blk">15</span> blocked</span>
+      <span class="st-done">✓ <span id="c-done">51</span> closed</span>
+      <span class="spacer"></span>
+      <span class="upd" id="upd">updated 0s ago</span>
+    </div>
+
+    <!-- main -->
+    <div class="main">
+      <div class="col-l">
+        <div class="pane focused">
+          <span class="pane-title">TASKS · epic</span>
+          <span class="pane-hint">[s]tatus [e]pic</span>
+          <div class="searchbar" id="searchbar">/<input id="searchinput" spellcheck="false"></div>
+          <div class="pane-body" id="tasks"></div>
+        </div>
+        <div class="pane actors">
+          <span class="pane-title">ACTORS</span>
+          <div class="actor-line" id="actors"></div>
+        </div>
+      </div>
+      <div class="pane">
+        <span class="pane-title">LIVE EVENTS</span>
+        <span class="pane-hint">[a]ctor filter</span>
+        <div class="pane-body" id="events"></div>
+      </div>
+    </div>
+
+    <!-- footer -->
+    <div class="keys">
+      <span><b>↑↓</b> select</span>
+      <span><b>⏎</b> detail</span>
+      <span><b>/</b> search</span>
+      <span><b>s/e</b> group</span>
+      <span><b>a</b> actor</span>
+      <span><b>q</b> quit</span>
+      <span class="spacer"></span>
+      <span class="ro">bd --readonly · watch: .beads/ · debounce 250ms</span>
+    </div>
+
+  </div>
+
+  <!-- detail overlay -->
+  <div class="overlay" id="overlay">
+    <div class="detail">
+      <span class="pane-title" id="d-title">voltrol-3ak.6</span>
+      <span class="pane-hint">esc close</span>
+      <div class="detail-body" id="d-body"></div>
+    </div>
+  </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const now = Date.now();
+  const T = (secAgo) => new Date(now - secAgo * 1000);
+  const fmt = (d) => d.toTimeString().slice(0, 8);
+
+  // ── data (real voltrol beads + audit-log reasons from recon) ──────────────
+  const issues = [
+    { id: "voltrol-3ak",   epic: true,  title: "Status-bar identity & activity", status: "open", prio: 1 },
+    { id: "voltrol-3ak.6", parent: "voltrol-3ak", title: "Status-bar bolt reflects AUDIO ACTIVITY, not popover visibility — charged when playing, static when silent", status: "wip", prio: 1 },
+    { id: "voltrol-3ak.7", parent: "voltrol-3ak", title: "Popover show/hide perf — remove layout cascade on toggle", status: "open", prio: 2 },
+    { id: "voltrol-zlw",   parent: "voltrol-3ak", title: "Menu-bar flash timer wakeups — alphaValue toggle regression", status: "open", prio: 1 },
+    { id: "voltrol-8fq",   epic: true,  title: "Helix render pipeline", status: "open", prio: 2 },
+    { id: "voltrol-64f",   parent: "voltrol-8fq", title: "Cubic Bézier helix paths (step=12, 6× fewer path ops)", status: "done", prio: 2 },
+    { id: "voltrol-ho8",   parent: "voltrol-8fq", title: "Compound spark path — single ctx.fill", status: "done", prio: 3 },
+    { id: "voltrol-9xx",   title: "CI: notarization step flakes when runner sleeps mid-staple", status: "blk", prio: 2, stale: true },
+  ];
+
+  const actors = {
+    "sonnet-impl-2": { cls: "ac-2", last: 4 },
+    "sonnet-impl-1": { cls: "ac-1", last: 187 },
+    "Rohit Gudi":    { cls: "ac-0", last: 26 },
+  };
+
+  const feed = [
+    { t: 4,    actor: "sonnet-impl-2", id: "voltrol-3ak.6", kind: "field",
+      line: 'status <span class="k-open">open</span> <span class="arr">→</span> <span class="k-wip">in_progress</span>' },
+    { t: 26,   actor: "Rohit Gudi", id: "voltrol-zlw", kind: "field",
+      line: 'status <span class="k-closed">closed</span> <span class="arr">→</span> <span class="k-open">open</span>',
+      reason: "regression: bolt stuck dim after display wake" },
+    { t: 187,  actor: "sonnet-impl-1", id: "voltrol-64f", kind: "field",
+      line: 'status <span class="k-wip">in_progress</span> <span class="arr">→</span> <span class="k-closed">closed</span> ✓',
+      reason: "Implemented cubic Bézier helix paths (step=12, 6× fewer path ops) with compound spark path (single ctx.fill). Both in drawHelix, build passes." },
+    { t: 204,  actor: "derived", id: "voltrol-9xx", kind: "derived",
+      line: '<span class="k-created">created</span> <span class="k-derived">(snapshot diff — no audit entry)</span>' },
+    { t: 233,  actor: "sonnet-impl-1", id: "voltrol-ho8", kind: "field",
+      line: 'status <span class="k-wip">in_progress</span> <span class="arr">→</span> <span class="k-closed">closed</span> ✓',
+      reason: "Implemented cubic Bézier helix paths — compound spark path lands with voltrol-64f." },
+    { t: 419,  actor: "Rohit Gudi", id: "voltrol-zlw", kind: "field",
+      line: 'status <span class="k-open">open</span> <span class="arr">→</span> <span class="k-closed">closed</span> ✓',
+      reason: "Switched from setImage: to alphaValue toggle — eliminates NSStatusBarButton layout cascade. Measured 7/10 timer samples were in _adjustLength; CALayer alpha change has no layout cost." },
+    { t: 560,  actor: "sonnet-impl-2", id: "voltrol-3ak.6", kind: "field",
+      line: 'assignee <span class="arr">→</span> sonnet-impl-2' },
+  ];
+
+  const glyphs = { open: ["○", "g-open"], wip: ["◐", "g-wip"], blk: ["❄", "g-blk"], done: ["✓", "g-done"] };
+
+  // ── state ──
+  let sel = 1, groupBy = "epic", search = "", lastUpdate = now;
+  let flatRows = [];
+
+  // ── render: tasks ──
+  const tasksEl = document.getElementById("tasks");
+  function renderTasks() {
+    tasksEl.innerHTML = "";
+    flatRows = [];
+    const match = (i) => !search || (i.id + " " + i.title).toLowerCase().includes(search.toLowerCase());
+
+    const addRow = (i, child) => {
+      if (!match(i)) return;
+      const idx = flatRows.length;
+      flatRows.push(i);
+      const [g, gcls] = glyphs[i.status];
+      const div = document.createElement("div");
+      div.className = "row" + (child ? " child" : "") + (idx === sel ? " selected" : "")
+        + (i.status === "done" ? " done" : "") + (i.stale ? " stale" : "");
+      div.dataset.id = i.id;
+      div.innerHTML = `<span class="glyph ${gcls}">${g}</span><span class="id">${i.id}</span>`
+        + `<span class="title">${i.title}</span><span class="prio p${i.prio}">● P${i.prio}</span>`;
+      div.onclick = () => { sel = idx; renderTasks(); };
+      tasksEl.appendChild(div);
+    };
+
+    if (groupBy === "epic") {
+      for (const e of issues.filter(i => i.epic)) {
+        const g = document.createElement("div");
+        g.className = "grp";
+        g.innerHTML = `▾ <span class="gid">${e.id}</span> ${e.title}`;
+        tasksEl.appendChild(g);
+        addRow(e, false);
+        tasksEl.removeChild(tasksEl.lastChild); flatRows.pop(); // epic header only, not selectable row
+        for (const c of issues.filter(i => i.parent === e.id)) addRow(c, true);
+      }
+      const orphans = issues.filter(i => !i.epic && !i.parent);
+      if (orphans.length) {
+        const g = document.createElement("div");
+        g.className = "grp"; g.textContent = "▾ (no epic)";
+        tasksEl.appendChild(g);
+        for (const o of orphans) addRow(o, true);
+      }
+    } else {
+      for (const [st, label] of [["wip","IN PROGRESS"],["blk","BLOCKED"],["open","OPEN"],["done","CLOSED"]]) {
+        const grp = issues.filter(i => !i.epic && i.status === st);
+        if (!grp.length) continue;
+        const g = document.createElement("div");
+        g.className = "grp"; g.textContent = "▾ " + label;
+        tasksEl.appendChild(g);
+        for (const i of grp) addRow(i, true);
+      }
+    }
+    if (sel >= flatRows.length) sel = Math.max(0, flatRows.length - 1);
+    document.querySelector(".pane-title").textContent = "TASKS · " + groupBy;
+  }
+
+  // ── render: actors ──
+  const actorsEl = document.getElementById("actors");
+  function renderActors() {
+    actorsEl.innerHTML = "";
+    for (const [name, a] of Object.entries(actors)) {
+      const age = Math.round((Date.now() - now) / 1000) + a.last;
+      const live = age < 120;
+      const span = document.createElement("span");
+      span.className = "actor " + (live ? "a-live" : "a-idle");
+      span.innerHTML = `<span class="${a.cls}">${live ? "●" : "○"}</span> ${name} <span class="age">${fmtAge(age)}</span>`;
+      actorsEl.appendChild(span);
+    }
+  }
+  const fmtAge = (s) => s < 60 ? s + "s" : s < 3600 ? Math.floor(s / 60) + "m" : Math.floor(s / 3600) + "h";
+
+  // ── render: events ──
+  const eventsEl = document.getElementById("events");
+  function eventNode(ev, flash) {
+    const a = actors[ev.actor];
+    const acls = ev.actor === "derived" ? "ac-d" : (a ? a.cls : "ac-3");
+    const div = document.createElement("div");
+    div.className = "ev" + (flash ? " flash" : "");
+    div.innerHTML =
+      `<div class="l1"><span class="t">${fmt(T(ev.t))}</span>` +
+      `<span class="actor-n ${acls}">${ev.actor}</span><span class="iid">${ev.id}</span></div>` +
+      `<div class="l2">${ev.line}</div>` +
+      (ev.reason ? `<div class="l3">“${ev.reason}”</div>` : "");
+    return div;
+  }
+  function renderEvents() {
+    eventsEl.innerHTML = "";
+    for (const ev of feed) eventsEl.appendChild(eventNode(ev, false));
+  }
+
+  // ── header freshness ──
+  const updEl = document.getElementById("upd");
+  setInterval(() => {
+    const s = Math.round((Date.now() - lastUpdate) / 1000);
+    updEl.textContent = "updated " + fmtAge(s) + " ago";
+    updEl.className = "upd" + (s < 3 ? " fresh" : "");
+    renderActors();
+  }, 1000);
+
+  // ── simulated live stream (what the notify→debounce→refresh loop produces) ──
+  const script = [
+    { after: 6000, actor: "sonnet-impl-2", id: "voltrol-3ak.6", kind: "field",
+      line: 'comment <span class="arr">+</span> “CoreAudio tap registered; listening on kAudioDevicePropertyDeviceIsRunningSomewhere”' },
+    { after: 15000, actor: "sonnet-impl-2", id: "voltrol-3ak.6", kind: "field",
+      line: 'status <span class="k-wip">in_progress</span> <span class="arr">→</span> <span class="k-closed">closed</span> ✓',
+      reason: "Flash timer now gated on device-running listener; popover observers removed. Build + manual audio test pass.",
+      apply: () => { setStatus("voltrol-3ak.6", "done"); bump("c-wip", -1); bump("c-done", +1); } },
+    { after: 27000, actor: "derived", id: "voltrol-a2c", kind: "derived",
+      line: '<span class="k-created">created</span> “Debounce audio-activity flapping &lt; 300ms” <span class="k-derived">(snapshot diff)</span>',
+      apply: () => {
+        issues.splice(4, 0, { id: "voltrol-a2c", parent: "voltrol-3ak", title: "Debounce audio-activity flapping < 300ms — bolt strobes on short sounds", status: "open", prio: 2 });
+        bump("c-open", +1); bump("total", +1);
+      } },
+    { after: 42000, actor: "Rohit Gudi", id: "voltrol-zlw", kind: "field",
+      line: 'note <span class="arr">+</span> “repro: only after clamshell wake, not idle wake — suspect NSWorkspace notification ordering”' },
+    { after: 58000, actor: "sonnet-impl-1", id: "voltrol-9xx", kind: "field",
+      line: 'priority <span class="arr">→</span> <span class="p1">P1</span> · defer cleared' },
+  ];
+  function setStatus(id, st) {
+    const i = issues.find(x => x.id === id); if (i) i.status = st;
+    renderTasks();
+    const row = tasksEl.querySelector(`[data-id="${CSS.escape(id)}"]`);
+    if (row) { row.classList.add("flash"); }
+  }
+  function bump(elId, d) {
+    const el = document.getElementById(elId);
+    el.textContent = String(parseInt(el.textContent, 10) + d);
+  }
+  for (const ev of script) {
+    setTimeout(() => {
+      ev.t = Math.round((Date.now() - now) / 1000) * -1; // future-relative; fmt handles negatives fine
+      const node = eventNode({ ...ev, t: -((Date.now() - now) / 1000) }, true);
+      eventsEl.prepend(node);
+      lastUpdate = Date.now();
+      if (actors[ev.actor]) actors[ev.actor].last = -Math.round((Date.now() - now) / 1000);
+      if (ev.apply) ev.apply();
+      renderActors();
+    }, ev.after);
+  }
+
+  // ── detail overlay ──
+  const overlay = document.getElementById("overlay");
+  const dTitle = document.getElementById("d-title");
+  const dBody = document.getElementById("d-body");
+  const details = {
+    "voltrol-3ak.6": {
+      kv: { status: "in_progress", priority: "P1", type: "task", parent: "voltrol-3ak", owner: "sonnet-impl-2", created_by: "Rohit Gudi", updated: "4s ago" },
+      desc: `<span class="verbatim">USER REQUEST, verbatim:</span> "Icon on the status bar should be active when there are active volume/sound sources playing, versus not active (lightning bolt does not charge/static when no activity)."
+
+This is a behavioural change, not styling, and it is the only bead in this epic that touches protected product identity — read the constraints before touching code.
+
+TODAY: StatusItemController.startFlashTimer() at :88 creates a 0.9s repeating Timer that toggles between litIcon and dimIcon (bolt.fill and bolt). Its gate is popover VISIBILITY: started from the NSPopover.didShowNotification observer and stopped from didCloseNotification (:55-82).
+
+WANTED: the same flash, gated on whether any app is actually producing audio. Playing means charging. Silence means a static bolt.`,
+      hist: [
+        "12:01:07  sonnet-impl-2   status open → in_progress",
+        "11:54:20  sonnet-impl-2   assignee → sonnet-impl-2",
+        "09:12:45  Rohit Gudi      created (epic voltrol-3ak, P1)",
+      ],
+    },
+  };
+  function openDetail() {
+    const i = flatRows[sel]; if (!i) return;
+    const d = details[i.id] || {
+      kv: { status: i.status, priority: "P" + i.prio, type: i.epic ? "epic" : "task", parent: i.parent || "—", created_by: "Rohit Gudi", updated: "2h ago" },
+      desc: i.title,
+      hist: feed.filter(e => e.id === i.id).map(e => `${fmt(T(e.t))}  ${e.actor.padEnd(14)} ${e.line.replace(/<[^>]+>/g, "")}`),
+    };
+    dTitle.textContent = i.id + " — bd show";
+    dBody.innerHTML =
+      `<div class="kv">` + Object.entries(d.kv).map(([k, v]) => `<span>${k}: <b>${v}</b></span>`).join("") + `</div>` +
+      `<h3>${i.title}</h3><div class="desc">${d.desc}</div>` +
+      `<div class="hist-h">HISTORY (bd history ${i.id})</div><div class="hist">` +
+      d.hist.map(h => `<div>${h}</div>`).join("") + `</div>`;
+    overlay.classList.add("on");
+  }
+
+  // ── search ──
+  const searchbar = document.getElementById("searchbar");
+  const searchinput = document.getElementById("searchinput");
+  searchinput.addEventListener("input", () => { search = searchinput.value; renderTasks(); });
+
+  // ── keys ──
+  document.addEventListener("keydown", (e) => {
+    if (overlay.classList.contains("on")) {
+      if (e.key === "Escape" || e.key === "q" || e.key === "Enter") overlay.classList.remove("on");
+      return;
+    }
+    if (document.activeElement === searchinput) {
+      if (e.key === "Escape") { searchbar.classList.remove("on"); searchinput.value = ""; search = ""; searchinput.blur(); renderTasks(); }
+      if (e.key === "Enter") searchinput.blur();
+      return;
+    }
+    switch (e.key) {
+      case "ArrowDown": case "j": sel = Math.min(sel + 1, flatRows.length - 1); renderTasks(); e.preventDefault(); break;
+      case "ArrowUp": case "k": sel = Math.max(sel - 1, 0); renderTasks(); e.preventDefault(); break;
+      case "Enter": openDetail(); break;
+      case "e": groupBy = "epic"; renderTasks(); break;
+      case "s": groupBy = "status"; renderTasks(); break;
+      case "/": searchbar.classList.add("on"); searchinput.focus(); e.preventDefault(); break;
+    }
+  });
+
+  renderTasks();
+  renderActors();
+  renderEvents();
+})();
+</script>
+</body>
+</html>

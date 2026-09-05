@@ -1,0 +1,991 @@
+[
+  {
+    "id": "voltrol-3ak.6",
+    "title": "Status-bar bolt reflects AUDIO ACTIVITY, not popover visibility — charged when playing, static when silent",
+    "description": "USER REQUEST, verbatim: \"Icon on the status bar should be active when there are active volume/sound sources playing, versus not active (lightning bolt does not charge/static when no activity).\"\n\nThis is a behavioural change, not styling, and it is the only bead in this epic that touches protected product identity — read the constraints before touching code.\n\nTODAY: StatusItemController.startFlashTimer() at :88 creates a 0.9s repeating Timer that toggles between litIcon and dimIcon (bolt.fill and bolt). Its gate is popover VISIBILITY: started from the NSPopover.didShowNotification observer and stopped from didCloseNotification (:55-82). stopFlashTimer() parks the icon on litIcon. The doc comment states it runs only while the popover is visible because a 0.9s timer for a hidden menu-bar animation was pure background wakeups — that is bead voltrol-zlw.\n\nWANTED: the same flash, gated on whether any app is actually producing audio. Playing means charging. Silence means a static bolt.\n\nPROTECTED — DO NOT VIOLATE (voltrol-4jm, and bd memory the-menu-bar-icon-flash-animation-must-stay): the flash MECHANISM is the bolt-outline to bolt-fill image swap on a 0.9s timer. It was once replaced with an alpha-fade for CPU reasons and the user reverted it. This bead changes ONLY the GATE that decides when the flash runs. Style, cadence, and mechanism stay exactly as they are. If an implementation finds itself editing how the swap happens, it has gone out of scope.\n\nTHIS REVERSES voltrol-zlw, deliberately and with user authority. The timer will now sometimes run while the popover is closed. That is the point. Mitigate rather than refuse:\n- the timer only runs while audio is actually playing, so a silent machine still costs nothing;\n- set a tolerance (the existing timer already sets 0.1) so the OS can coalesce;\n- the activity poll itself must be cheap and low-frequency, 1-2Hz not 20Hz.\n\nTHE HARD PART — getting an activity signal with the popover CLOSED:\n- WaveformClock stops ALL its timers when the last subscriber unsubscribes (WaveformView.swift:89-98). With the popover closed there are zero subscribers, so nothing is sampling. The IO procs keep running (voltrol-uki), so the DATA exists; nothing is reading it.\n- AudioState.combinedAudioLevel (AudioState.swift:141-149) is an O(N) scan across every app reading per-tap atomics. Cheap per call but it scales with app count, and voltrol-7yd already proposed AudioTapManager maintaining a running max instead. That running max is the right signal here too — do it once and both consumers benefit.\n- HYSTERESIS IS MANDATORY. Raw level crossing a threshold will strobe the menu bar on every gap between words, every pause between tracks. Attack fast (roughly 100ms so it feels responsive) and release slow (1-2s so a brief silence does not kill it). A menu-bar icon that flickers on and off is worse than one that never animates.\n- Decide and record the behaviour when everything is muted. Muted should read as inactive, since nothing is audibly playing.\n- Decide whether popover-open forces active regardless of audio. Recommendation: yes, keep it lit while open so the UI feels alive during interaction.\n\nINTERACTION WITH THE OPEN BUG: this flash timer is one of the ten RunLoop.Mode.default timers (voltrol-qv8.4), which is why the bolt stops while a right-click menu is open. Fixing the gate without fixing the mode ships a bolt that still freezes. Sequence qv8.4 first or land them together.",
+    "design": "Gate, not mechanism. Activity signal comes from a running max maintained by AudioTapManager (shared with voltrol-7yd), sampled at 1-2Hz, passed through an asymmetric attack/release envelope before it is allowed to start or stop the existing flash timer. The 0.9s bolt-to-bolt.fill swap is untouched.",
+    "acceptance_criteria": "Bolt flashes when any unmuted app is producing audio and is static otherwise, with the popover closed; no visible strobing across speech pauses or track gaps; idle-silent CPU indistinguishable from today; the 0.9s image-swap mechanism byte-for-byte unchanged in style and cadence; voltrol-4jm tests still pass.",
+    "notes": "Explicitly supersedes the voltrol-zlw decision that the flash timer runs only while the popover is visible. That was a power optimisation; the user has now asked for activity-driven behaviour with full knowledge of the tradeoff. Do not silently re-apply zlw.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "feature",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-14T15:19:47Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-14T15:19:47Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-3ak.6",
+        "depends_on_id": "voltrol-qv8.4",
+        "type": "blocks",
+        "created_at": "2026-08-14T11:21:10Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-3ak.6",
+        "depends_on_id": "voltrol-3ak",
+        "type": "parent-child",
+        "created_at": "2026-08-14T11:19:46Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 0,
+    "comment_count": 0,
+    "parent": "voltrol-3ak"
+  },
+  {
+    "id": "voltrol-qv8.7",
+    "title": "[bug] Device switch is fire-once, verify-never: no post-restart audio verification, no retry (root-cause candidate for voltrol-0us)",
+    "description": "Directly addresses the monitor switch-back failure, and deliberately NOT device-specific.\n\nAudioState.handleDeviceChange() (AudioState.swift:323-340) does a single-shot rebuild: refresh list, guard the UID actually changed, log, set currentTapOutputUID, tapManager.restartAllTaps(for: apps), re-attach the volume listener, re-pick the master mechanism. Each rebuilt tap bakes readDefaultOutputDevice() into a private aggregate as its sub-device (AudioTapManager.swift:831,846-855).\n\nTwo gaps, both consistent with \"sometimes\":\n1. NO VERIFICATION. Nothing checks that the rebuilt taps actually produce audio. A DisplayPort/HDMI/USB-C display audio device is frequently not fully alive at the instant the default flips back to it — the aggregate can be created successfully against a device with no ready output stream or a mismatched clock domain, so setupTap SUCCEEDS and the result is silent. That is voltrol-0us hypothesis 3, and the app cannot currently tell that state from success.\n2. NO RETRY. A single attempt at one instant. Whether it lands depends on a race with the display audio device becoming ready — which is exactly why it works most times and fails sometimes, and why it is worse for monitors than for USB headphones.\n\nThis is the same defect class as voltrol-kw9 (tap start failures invisible in the UI and never retried), but on the route-change path rather than the app-lifecycle path. Consider fixing them with one mechanism.\n\nFix direction: after restartAllTaps, verify the route actually took — confirm each controller reached running state AND that its aggregate sub-device UID equals the current default AND (best signal) that a nonzero level appears within a bounded window for an app known to be playing. On failure, bounded retry with backoff (e.g. 250ms/1s/3s), each attempt re-reading the default device fresh rather than trusting the value captured at t0. Surface persistent failure in the UI instead of failing silently (kw9).\n\nDo NOT special-case the LG monitor or any UID. The class is display audio devices with slow readiness.",
+    "design": "Retry must be transactional per the CLAUDE.md invariant: never evict a working tap for a replacement that did not reach running state. Retries need the routeGeneration staleness guard (AudioTapManager.swift:299) so a later real switch cancels an in-flight retry chain. Gate the design on the sweep data from voltrol-qv8.3 — if success rate rises with settle delay, this is the right fix.",
+    "acceptance_criteria": "device-switch-repro.sh reports \u003e=20/20 successful switch-backs to a display audio device, including at least one run where the first attempt is observed failing and the retry recovering it (proving the retry path executes, not just that the race got lucky).",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "bug",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-11T10:10:23Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-11T10:10:23Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-qv8.7",
+        "depends_on_id": "voltrol-qv8",
+        "type": "parent-child",
+        "created_at": "2026-08-11T06:10:23Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-qv8.7",
+        "depends_on_id": "voltrol-qv8.3",
+        "type": "blocks",
+        "created_at": "2026-08-11T06:11:00Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 1,
+    "comment_count": 0,
+    "parent": "voltrol-qv8"
+  },
+  {
+    "id": "voltrol-qv8.6",
+    "title": "[bug] isActive latch is a self-sealing freeze: TimelineView pause depends on the very clock that may have stopped",
+    "description": "Structural fragility in Voltrol/Views/WaveformView.swift that converts ANY transient tick outage into a PERMANENT freeze. This is the mechanism that explains \"stops working and stays broken\" — the other beads explain why ticks stop; this explains why they never come back.\n\nThe loop:\n- WaveformView.swift:227 pauses rendering when !isActive: TimelineView(.animation(paused: reduceMotion || isMuted || !isActive)).\n- isActive (:221, @State, defaults true) is written ONLY from model.onSilenceChanged (:252).\n- onSilenceChanged is invoked ONLY from WaveformModel.tick() (:147), which runs ONLY from a WaveformClock timer fire (:68-87).\n\nSo once isActive latches false (normal — any silent period), the ONLY path back to true is a clock tick. If the clock is stalled, throttled, or the model was torn down, the view is frozen and there is no watchdog, no timeout, no fallback. Nothing self-heals.\n\nSecond, independent failure path in the same file: WaveformModel.stop() (:165-170) nils BOTH provider and onSilenceChanged. It is called from .onDisappear (:255). The only restarts are .onAppear (:251) and .onChange(of: reduceMotion) (:259). SwiftUI does not guarantee onDisappear implies the view left the screen for good, and rows here are recreated/reordered by a level-tier sort (AudioState.computeFilteredApps, AudioState.swift:123-138, re-ranked on every invalidateFilteredAppsCache — tap rebuild, popover open, device switch). A spurious or racing onDisappear leaves an ON-SCREEN view holding a model with provider == nil, whose tick() returns immediately at :143 — permanently dead, with no onAppear coming to revive it.\n\nFix direction (pick after evidence, do not guess): derive the paused condition from data the render loop can see itself (e.g. amplitude()/model.recentAverage read directly in the TimelineView closure) rather than a latch fed by a separate timer; and/or add a liveness watchdog that force-resumes if no tick has landed in N seconds; and/or make onAppear re-arm unconditionally so a stale model cannot survive a re-appear.\n\nDepends on the counters in voltrol-qv8.1 to tell the two paths apart in the field: \"ticking but paused\" vs \"not ticking\".",
+    "design": "Whatever the fix, the invariant must be: a WaveformView that is on screen with a live provider ALWAYS recovers to animating within a bounded time, regardless of timer history. Keep the visual identical — this is a liveness fix, not a redesign.",
+    "acceptance_criteria": "A headless test drives the model into isActive=false, simulates a tick outage, restores the provider to a loud signal, and asserts the view resumes within the bounded window. Existing WaveformClockTests/WaveformModelTests stay green.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "bug",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-11T10:10:22Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-11T10:10:22Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-qv8.6",
+        "depends_on_id": "voltrol-qv8.1",
+        "type": "blocks",
+        "created_at": "2026-08-11T06:10:59Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-qv8.6",
+        "depends_on_id": "voltrol-qv8",
+        "type": "parent-child",
+        "created_at": "2026-08-11T06:10:22Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 0,
+    "comment_count": 0,
+    "parent": "voltrol-qv8"
+  },
+  {
+    "id": "voltrol-qv8.5",
+    "title": "[bug] No App Nap mitigation anywhere — leading suspect for animations stopping after prolonged uptime",
+    "description": "CONFIRMED ABSENT BY CODE READ: grep for beginActivity, NSSupportsAutomaticTermination, and LSAppNapIsDisabled across Voltrol/ and project.yml returns nothing.\n\nVoltrol is an LSUIElement agent with no Dock icon and no visible window most of the time — the exact profile macOS App Naps aggressively. App Nap coalesces timers into multi-second windows, drops thread QoS, and throttles run-loop servicing. Symptom of a napped agent: timers still \"work\" but fire late and irregularly, so animations become stuttery and then effectively stop, and the app looks fine in every other respect. That is a precise match for the reported \"animations stop working after a while.\"\n\nWhy the app is a strong candidate: after voltrol-zlw the flash timer runs ONLY while the popover is visible, and WaveformClock stops all timers when the last subscriber unsubscribes (WaveformView.swift:89-98). So with the popover closed, the process legitimately goes near-idle — which is exactly the state that lets macOS decide it is nappable. When the popover then opens, the nap may not lift promptly.\n\nMEASURE BEFORE FIXING (this bead is gated on voltrol-qv8.1 + qv8.2). Confirm with taskinfo \u003cpid\u003e / pmset -g assertions during a real stall before changing anything.\n\nFix if confirmed: hold a scoped ProcessInfo.processInfo.beginActivity(options: [.userInitiated], reason: \"popover visible\") assertion for the popover-visible window only, released on popover close. SCOPED IS THE POINT — a process-lifetime assertion would defeat the always-on-agent power promise in CLAUDE.md (Product Principles: idle near zero CPU/power). Do NOT set LSAppNapIsDisabled globally.",
+    "design": "Assertion acquired in the NSPopover.didShowNotification observer and released in didCloseNotification (StatusItemController.swift:60-82) — same lifecycle as startFlashTimer/stopFlashTimer, so it is one more line in each. Must be idempotent like startFlashTimer already is. Verify idle power is unchanged with the popover closed.",
+    "acceptance_criteria": "Evidence from the soak run showing (a) whether the process was napped during a reproduced stall, and (b) if it was, that tick rate stays at nominal across a \u003e=4h popover-open window after the fix, with closed-popover idle CPU unchanged from baseline.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "bug",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-11T10:09:32Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-11T10:09:32Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-qv8.5",
+        "depends_on_id": "voltrol-qv8.2",
+        "type": "blocks",
+        "created_at": "2026-08-11T06:10:58Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-qv8.5",
+        "depends_on_id": "voltrol-qv8",
+        "type": "parent-child",
+        "created_at": "2026-08-11T06:09:31Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 0,
+    "comment_count": 0,
+    "parent": "voltrol-qv8"
+  },
+  {
+    "id": "voltrol-qv8.4",
+    "title": "[bug] All 10 Timers are .default-mode only — every timer dies during AppKit tracking loops (slider drag, right-click menu)",
+    "description": "CONFIRMED BY CODE READ, not hypothesis. Every Timer in the app is created with Timer.scheduledTimer(withTimeInterval:repeats:), which schedules on the current run loop in RunLoop.Mode.default ONLY. AppKit runs a nested tracking run loop in eventTracking mode during: NSSlider mouse drags, NSMenu display (the status-item right-click menu), window/popover resize, and scroll tracking. In those modes a .default-only timer does not fire at all.\n\nEvery timer in the app (grep confirms zero uses of .common anywhere):\n- Voltrol/Views/WaveformView.swift:39,47 — the 1Hz and 20Hz waveform clocks. Waveforms FREEZE while you drag any volume slider, which is precisely when the user is looking at them.\n- Voltrol/StatusItemController.swift:88 — the 0.9s bolt flash. Stops while the right-click menu is open. (The animation itself is protected product identity per voltrol-4jm/bd memory; this fixes its DELIVERY, not its style, cadence, or mechanism — image swap and 0.9s interval are untouched.)\n- Voltrol/Audio/AudioState.swift:318 — the 0.05s device-change debounce. A device switch performed while a menu is open or a slider is held gets its tap rebuild deferred until tracking ends. DIRECT CONTRIBUTOR to voltrol-0us: users switch output devices from menus.\n- Voltrol/Audio/AudioTapManager.swift:146 (2s deferred restart), :269 (materialize stagger).\n- Voltrol/Audio/ProcessMonitor.swift:122 (10s poll), :422 (0.4s debounce).\n- Voltrol/Storage/VolumeStore.swift:83 (0.5s persistence flush) — a drag-end flush can be delayed past a crash/quit window.\n- Voltrol/Views/ContentView.swift:132 (1s permission poll).\n\nThis alone does not explain a stall that persists AFTER tracking ends, so it is not the whole animation bug — but it is a real, deterministic, reproducible-in-10-seconds animation defect and it is a plausible trigger for the device-switch race.\n\nFix: build with Timer(timeInterval:repeats:) + RunLoop.main.add(timer, forMode: .common) (or a scheduledTimer followed by re-adding in .common). Audit all 10 sites; some may legitimately want .default (none obviously do).",
+    "design": ".common is a mode SET including .default and .eventTracking. Preserve every existing tolerance value (0.010 waveform, 0.1 flash/slow, 0.2 deferred) — they are deliberate power tuning. Consider a small VLog/Timer factory helper so the mode choice is made once, not 10 times.",
+    "acceptance_criteria": "Reproduce first: open the popover with audio playing, drag a slider, observe the waveform freeze for the duration of the drag; open the right-click menu, observe the bolt stop flashing. After the fix both continue animating. A test pins that the scheduling helper adds to .common.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "bug",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-11T10:09:31Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-11T10:09:31Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-qv8.4",
+        "depends_on_id": "voltrol-qv8",
+        "type": "parent-child",
+        "created_at": "2026-08-11T06:09:30Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 2,
+    "comment_count": 0,
+    "parent": "voltrol-qv8"
+  },
+  {
+    "id": "voltrol-qv8.3",
+    "title": "scripts/device-switch-repro.sh — make the monitor switch-back failure deterministic instead of anecdotal",
+    "description": "voltrol-0us has been open since 2026-07-15 and in_progress since 07-23 with four untested hypotheses, because the failure is intermittent (\"sometimes\") and nobody has a repro loop. Stop waiting for it to happen.\n\nHarness that drives N automated round-trips of the system default output device (headphones/built-in \u003c-\u003e monitor) and, for each round-trip, records:\n- wall-clock t0 of the switch,\n- the full VLog stream (the routing sites are now .warn/.error and disk-persisted per voltrol-t01, so `log show` retrieves them post-hoc),\n- whether deviceChange HAL fired (AudioState.swift:332 logs it),\n- whether restartAllTaps ran and how many taps reached running state,\n- time-to-first-nonzero audioLevel after the switch (the real success signal — a tap that \"started\" but produces silence is the exact failure mode hypothesis 3 in voltrol-0us predicts),\n- pass/fail per round-trip and an aggregate success rate.\n\nDevice switching from the CLI: SwitchAudioSource (brew) or a small Swift helper calling kAudioHardwarePropertyDefaultOutputDevice, matching the seam AudioState.selectOutputDevice already uses.\n\nNOT device-specific: the harness takes the two device UIDs as arguments. The LG monitor is just the instance that exposed it; DP/HDMI display audio as a class is the suspect (aggregate sub-device not alive yet at rebuild time).\n\nTarget: run it 20-50x. An intermittent bug with a 1-in-10 rate becomes a 20-minute measurement instead of a week of anecdotes.",
+    "design": "Deliberately include a variable settle delay between switch and measurement, and sweep it (0ms / 250ms / 1s / 3s). If success rate rises with the delay, hypothesis 2/3 in voltrol-0us is confirmed (stale read / device-not-yet-alive) and the fix is verify+retry rather than a bigger debounce.",
+    "acceptance_criteria": "One command produces a pass/fail table over N round-trips with a success rate and per-failure log excerpt; the failure is reproduced at least once under the harness.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-11T10:08:57Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-11T10:08:57Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-qv8.3",
+        "depends_on_id": "voltrol-qv8",
+        "type": "parent-child",
+        "created_at": "2026-08-11T06:08:57Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 2,
+    "comment_count": 0,
+    "parent": "voltrol-qv8"
+  },
+  {
+    "id": "voltrol-qv8.2",
+    "title": "scripts/soak.sh — long-run sampling harness (the deep monitoring session itself)",
+    "description": "The process to actually RUN. Voltrol has no way to observe itself over hours, which is the exact timescale the animation bug lives on.\n\nBuild a sampling harness that runs against the installed dogfood build for a long window (target \u003e=4h, ideally overnight) and writes a CSV + summary report:\n\nPer sample (every 30s):\n- CPU% and cumulative CPU time for the Voltrol process (ps / top -l 1 -pid).\n- Mach wakeups + idle-wakeups (the always-on-agent power metric).\n- Resident memory + CoreAudio object count (drift = leak signal, see voltrol-k9k).\n- App Nap state: whether the process is throttled. Sample `pmset -g assertions`, and taskinfo \u003cpid\u003e for role / QoS clamp. THIS IS THE PRIMARY HYPOTHESIS FOR THE ANIMATION STALL — an LSUIElement agent with no visible window is a textbook App Nap target and the codebase has zero mitigation (grep for beginActivity returns nothing).\n- The heartbeat counters from the instrumentation bead, scraped from log stream.\n\nReport: tick-rate over time (flat = healthy, decaying/cliff = the bug), correlated against App Nap transitions, CPU, and wakeups. A cliff at a specific uptime or a specific system event is the answer.\n\nAlso capture the user-driven scenarios during the soak: popover open/close cycles, slider drags, right-click menu opens, sleep/wake, display sleep, and output-device switches — with timestamps, so the tick-rate series can be cut against them.\n\nscripts/monitor.sh stays as-is (interactive tailer); this is the unattended data collector. Reuse its log predicate.",
+    "design": "zsh, matching the style of scripts/bench.sh and scripts/test.sh. Writes to a timestamped dir; never overwrites a prior run. Must survive the machine sleeping (log the gap rather than dying). Sleep/wake is itself a prime suspect and must be captured, not avoided.",
+    "acceptance_criteria": "A \u003e=4h run produces a CSV + summary naming whether the waveform tick rate stayed flat, and if not, the wall-clock moment and the correlated system event where it degraded.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-11T10:08:56Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-11T10:08:56Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-qv8.2",
+        "depends_on_id": "voltrol-qv8.1",
+        "type": "blocks",
+        "created_at": "2026-08-11T06:10:58Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-qv8.2",
+        "depends_on_id": "voltrol-qv8",
+        "type": "parent-child",
+        "created_at": "2026-08-11T06:08:56Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 1,
+    "comment_count": 0,
+    "parent": "voltrol-qv8"
+  },
+  {
+    "id": "voltrol-qv8.1",
+    "title": "Add runtime liveness counters + os_signpost regions — the animation stall is currently unfalsifiable",
+    "description": "Nothing in the app reports whether its own timers are still firing. When the user says \"animations stop working after a while\" there is no way to distinguish: (a) WaveformClock timer stopped, (b) timer fires but throttled by App Nap, (c) timer fires normally but TimelineView is paused via the isActive latch, (d) provider returns 0 because the tap died. All four look identical from outside.\n\nAdd a debug-gated heartbeat (VLog.warn so it PERSISTS to disk — voltrol-t01 established that .info is memory-only and unretrievable post-hoc) emitted every 30s while the popover is visible, plus on popover close:\n\n- WaveformClock: monotonically increasing tick counter per lane, wall-clock delta since last tick, normalSubscriberCount / slowSubscriberCount, isNormalTimerActive / isSlowTimerActive (all four accessors already exist as test seams at Voltrol/Views/WaveformView.swift:27-30).\n- Expected-vs-actual tick rate: 20Hz lane should log ~600 ticks/30s. Anything materially under that IS the App Nap / run-loop-mode evidence.\n- WaveformView: a TimelineView frame counter (30fps expected = ~900/30s) and the current isActive / isMuted / paused state, so a paused-but-ticking freeze is distinguishable from a not-ticking freeze.\n- StatusItemController: flash-timer fire counter (0.9s =\u003e ~33/30s).\n- AudioTapManager: controllers.count, count of controllers whose currentLevel has been 0 for the entire window.\n\nAlso wrap the RT-adjacent and UI-tick regions in os_signpost intervals — MetricSubscriber.swift:24 already documents signpostMetrics as a collected MetricKit field, but the app emits no signposts, so that lane is empty. Signposts also make the Instruments run in voltrol-x22 readable.\n\nRT-THREAD CONSTRAINT: none of this goes in RTContext.process. Counters live on @MainActor timer callbacks only.",
+    "design": "Debug-gated via the existing VLog level plumbing or a UserDefaults flag, NOT a compile-time #if — the stall reproduces on the installed Release-ish dogfood build, so the counters must be reachable there. Reuse WaveformClock test seams; do not add new state to the RT path.",
+    "acceptance_criteria": "A 30s window of log show output contains one heartbeat line per lane with tick counts, subscriber counts, timer-active flags, and TimelineView frame count; running the app, opening the popover, and leaving it open for 2 minutes produces 4 heartbeats with tick deltas within 10% of nominal.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-11T10:08:55Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-11T10:08:55Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-qv8.1",
+        "depends_on_id": "voltrol-qv8",
+        "type": "parent-child",
+        "created_at": "2026-08-11T06:08:55Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 2,
+    "comment_count": 0,
+    "parent": "voltrol-qv8"
+  },
+  {
+    "id": "voltrol-qv8",
+    "title": "[epic] Runtime perf deep-dive: instrument, soak, and fix animation stall + device switch-back",
+    "description": "Umbrella for the 2026-08-11 investigation. Two field bugs (waveform/flash animations stop after prolonged uptime; switching the system output BACK to the LG monitor sometimes does not route audio) share one root cause class: Voltrol has NO measurement of its own long-running behavior.\n\nExisting perf tooling measures the wrong layer:\n- VoltrolTests/PerformanceBenchmarks.swift (bench 01-05) = synthetic microbenchmarks inside a test host. Measures RT callback cost and helix path-element counts. Measures nothing about a live agent: no App Nap, no run-loop mode stalls, no timer drift, no uptime degradation.\n- scripts/monitor.sh = a log tailer with colour. No sampling, no counters, no time series.\n- MetricKit (Voltrol/Metrics/MetricSubscriber.swift) delivers at most once per ~24h on next launch. Useless for a debugging session.\n\nSo every hypothesis below is currently unfalsifiable in the field. Instrumentation lands FIRST, then the soak + repro harnesses produce evidence, then fixes are judged against that evidence.\n\nChildren: instrumentation counters, soak harness, device-switch repro harness, 4 root-cause fixes, 1 feature (waveform style system).\nRelated: voltrol-0us (device switch bug), voltrol-x22 (Time Profiler), voltrol-kw9 (tap failures invisible/never retried), voltrol-7yd (O(N) popover panel).",
+    "design": "Order is load-bearing: instrumentation -\u003e measurement -\u003e fix. Do not let a fix land before the counter that proves it worked. Each fix bead names the specific counter that must move.",
+    "acceptance_criteria": "All children closed; a soak report exists showing animation tick-rate flat over \u003e=4h uptime, and a device-switch repro run showing \u003e=20/20 successful switch-backs.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "epic",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-11T10:08:08Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-11T10:08:08Z",
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "voltrol-9pp",
+    "title": "CI red on main since 07-20: macos-26 runner no longer provisions → blocks entire auto-tag/release chain",
+    "description": "ci.yml build-and-test job fails at PROVISION time (runnerName empty, 0-line log, 3s duration) for every commit since 2140db8 (2026-07-20); last green was 9d6a096 (2026-07-19). The failure is environmental, not code: local ./scripts/test.sh passes 318/0, and the job records ZERO executed steps. runs-on: macos-26 (set deliberately in 00abce8 — the MetricKit payload API needs the macOS 26 SDK/Xcode 26.5) worked green through 07-19, then GitHub stopped provisioning the macos-26 label ~07-20. Because Auto-Tag runs on workflow_run(CI) and is gated on CI success, red CI means Auto-Tag SKIPS → no semver tag is cut → no release. This is the real, upstream reason t01(v0.5.2) and 68g never tagged and nothing has shipped since v0.5.1; it sits above voltrol-a8q (dispatch fix, done) and voltrol-g16 (signing secrets).",
+    "design": "Cannot simply downgrade to macos-15: the MetricKit payload API requires the macOS 26 SDK (Xcode 26.5), which macos-15's default Xcode lacks. Options: (a) confirm macos-26 label is GA vs preview/renamed and correct it; (b) if macos-15 image now ships Xcode 26.5, switch runner to macos-15 + keep xcode-select Xcode_26.5; (c) pin a runner image that provides Xcode 26.5. Requires verifying CURRENT GitHub runner-image facts before editing the release-critical pipeline — do not guess.",
+    "acceptance_criteria": "ci.yml build-and-test provisions a runner and runs to completion (green) on a push to main; a subsequent fix: commit cuts a semver tag via Auto-Tag without manual intervention; the MetricKit/macOS 26 SDK build requirement is still satisfied.",
+    "notes": "SEARCH FINDINGS (2026-07-23): macos-26 is GA since 2026-02-26, so the label is valid — yet jobs get NO runner in 3s. Leading suspect: GitHub Actions SPENDING/BILLING LIMIT (macOS runners bill 10x; a hit cap ~07-20 causes instant no-runner failures across all commits). CHECK FIRST: repo/org Settings -\u003e Billing -\u003e Actions spending limit + macOS minutes remaining; also Settings -\u003e Actions -\u003e runner/policy. Alternatives: transient GA incident (ruled unlikely — 4+ days consistent) or org policy disabling macОS runners. LATENT 2ND ISSUE once runners provision: the GitHub macos-26 image defaults to Xcode 26.4.1, NOT 26.5, but ci.yml hard-selects /Applications/Xcode_26.5.app (step 'Select Xcode') — verify the image ships 26.5 or adjust the pin (and re-confirm the MetricKit macOS 26 SDK requirement is met by 26.4.1). Do NOT blind-edit the release-critical pipeline: needs billing access + a runner/Xcode decision. Sources: github.blog/changelog/2026-02-26-macos-26-is-now-generally-available; actions/runner-images#14167.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "bug",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-07-24T02:32:39Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-07-24T02:33:37Z",
+    "dependency_count": 0,
+    "dependent_count": 1,
+    "comment_count": 0
+  },
+  {
+    "id": "voltrol-0us",
+    "title": "Switching output headphones-\u003emonitor after launch doesn't route tapped audio to the monitor",
+    "description": "Switching the system output device from headphones (connected + selected at launch) to a monitor output does NOT route tapped-app audio to the monitor — audio breaks. Reported live by the user (headphones connected now).\n\n## Code paths involved (traced, not yet root-caused)\n- Output switches are handled by `AudioState.handleDeviceChange()` (AudioState.swift:248-259), fired via HAL listeners on `kAudioHardwarePropertyDefaultOutputDevice` + `kAudioHardwarePropertyDevices` (lines 224-235), debounced 0.05s (scheduleDeviceChange, 241-246).\n- The restart is gated: `guard let newDefault = outputDevices.first(where: \\.isDefault), newDefault.uid != currentTapOutputUID else { return }` (255-256). On a real change it calls `tapManager.restartAllTaps(for: apps)` (259), which bumps `routeGeneration` (AudioTapManager.swift:250) and rebuilds every tap.\n- Each rebuilt tap's aggregate bakes the CURRENT default output as its sub-device: `setupTap()` reads `readDefaultOutputDevice()` (AudioTapManager.swift:831) and builds the private aggregate with that outputUID as `kAudioAggregateDeviceMasterSubDeviceKey` + sub-device (846-855).\n- `currentTapOutputUID` is seeded correctly at launch from the default device (AudioState.swift:65), so the guard is not obviously wrong on paper.\n\n## Hypotheses to test with real logs (VLog output from a repro is REQUIRED)\n1. Route-generation false-drop: the merged voltrol-i25 guard (AudioTapManager.swift:119-120) drops a deferred restart when `deferred.generation != routeGeneration`. A headphones-\u003emonitor switch can bounce the default device through several HAL notifications; if generations increment past an in-flight restart, the FINAL (correct, monitor) restart could be dropped as stale, leaving aggregates pointed at the old device.\n2. Stale read race: at the moment `restartAllTaps -\u003e setupTap` runs, `readDefaultOutputDevice()` may still return the OLD device if the default-change and the notification order race the debounce, baking headphones (or a vanished device) into the new aggregate.\n3. Monitor-as-sub-device failure: some monitor outputs (HDMI/DP/USB-C display audio) may create the aggregate successfully but produce no audible output (clock-domain / sample-rate mismatch with the private aggregate), so `setupTap` succeeds but audio is silent — distinct from a routing bug.\n4. `outputDevices.first(where: \\.isDefault)` may not mark the monitor as default if `readOutputDeviceList()` filtering/refresh lags the switch, making the guard `return` early and never restarting.\n\n## Steps to Reproduce\n1. Boot with headphones (e.g. AirPods/USB) connected and selected as system output.\n2. Launch Voltrol; play audio in a tapped app — confirm per-app volume works through headphones.\n3. Switch system output to a monitor (System Settings \u003e Sound, or menu-bar output picker).\n4. Observe: tapped-app audio does not come out of the monitor.\n\n## Expected Behavior\nAfter switching output to the monitor, every tap's aggregate is rebuilt around the monitor and tapped-app audio plays through it at the per-app volume.\n\n## Actual Behavior\nAudio does not play through the monitor after the switch (headphones-at-launch case).\n\n## What to capture next (this bug cannot be root-caused without it)\nRun a Screen-Recording-granted build, reproduce, and capture VLog output around the switch — specifically the `selectOutputDevice`/`deviceChange HAL`/`restartAllTaps`/`tap restart dropped (stale route gen ...)`/`tap outputUID=` lines — to distinguish hypotheses 1-4.\n",
+    "design": "Root-cause from VLog first (do not blind-fix). Prime suspect: route-generation false-drop interacting with multi-notification device bounces (voltrol-i25 guard) — verify whether the final monitor restart is being dropped as stale. Secondary: verify setupTap reads the settled new default, and that a monitor output is usable as a private-aggregate sub-device.",
+    "acceptance_criteria": "After switching system output from headphones (selected at launch) to a monitor, tapped-app audio plays through the monitor at per-app volume; a repro captured with VLog identifies which of hypotheses 1-4 is the cause; a regression test (headless where possible, else the VOLTROL_TAP_TESTS hardware lane) pins the correct rebuild-on-output-change behavior.",
+    "notes": "2026-08-11 investigation (epic voltrol-qv8) split this into a repro harness + two concrete root-cause candidates, both from a fresh code read:\n- voltrol-qv8.3 — scripts/device-switch-repro.sh: drive N automated round-trips with a settle-delay sweep. Stops this bug being anecdotal. Blocks both fixes below.\n- voltrol-qv8.7 — fire-once/verify-never: restartAllTaps has no post-restart audio verification and no retry, so a display-audio device that is not yet fully alive yields a tap that \"starts\" successfully but is silent. Matches hypothesis 3 in this bead. Same defect class as voltrol-kw9.\n- voltrol-qv8.8 — early-return stranding: the guard at AudioState.swift:330-331 infers the default from the just-refreshed LIST snapshot rather than reading the HAL default directly, and there is NO periodic route reconcile, so a missed notification persists until the next real device change. Matches hypotheses 2 and 4, and explains the switch-away-and-back workaround shape.\n- voltrol-qv8.4 — the 0.05s device-change debounce timer is .default-mode only, so a switch made from a menu is delayed until menu tracking ends. Aggravating factor, not the root cause.\nHypothesis 1 (route-generation false-drop) remains untested and is best answered by the repro harness logs.",
+    "status": "in_progress",
+    "priority": 1,
+    "issue_type": "bug",
+    "assignee": "Rohit Gudi",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-07-15T13:27:02Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-11T10:11:23Z",
+    "started_at": "2026-07-23T13:45:19Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-0us",
+        "depends_on_id": "voltrol-qv8.7",
+        "type": "blocks",
+        "created_at": "2026-08-11T06:11:23Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-0us",
+        "depends_on_id": "voltrol-qv8.8",
+        "type": "blocks",
+        "created_at": "2026-08-11T06:11:23Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 2,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "voltrol-g16",
+    "title": "Release pipeline blocked: 3 signing/notarization secrets missing",
+    "description": "No GitHub release has ever shipped — both Release runs (Apr 2026 v0.1.0 attempt, Jul 2026 v0.1.0) failed at 'Import Developer ID certificate' because repo secrets are missing. Present: APPLE_ID, APPLE_TEAM_ID, KEYCHAIN_PASSWORD. Missing: (1) DEVELOPER_ID_CERT_BASE64 — export a 'Developer ID Application' cert (NOT the local 'Apple Development' cert; create at developer.apple.com if none exists) from Keychain Access as .p12, then: base64 -i cert.p12 | gh secret set DEVELOPER_ID_CERT_BASE64; (2) DEVELOPER_ID_CERT_PASSWORD — the .p12 export password; (3) APPLE_ID_PASSWORD — app-specific password from account.apple.com for notarytool (release.yml line 138). After setting all three: gh run rerun 28747737539 to retry the v0.1.0 release on the existing tag. Human-only: requires Apple Developer account credentials.",
+    "notes": "Auto-watch scheduled trigger created (trig_01BKTEgziLWaNDLRwZLP2iRV, hourly via RemoteTrigger): once all 3 secrets are set, it automatically reruns the latest failed Release run and reports back, then asks the user to disable itself at claude.ai/code/scheduled. Unverified: whether the cloud environment's gh auth has repo access to caretak3r/voltrol -- check its first output.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-07-05T16:44:22Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-07-14T00:58:05Z",
+    "dependency_count": 0,
+    "dependent_count": 1,
+    "comment_count": 0
+  },
+  {
+    "id": "voltrol-d64",
+    "title": "Investigate macOS 26 fresh-install-denied Screen Recording behavior",
+    "description": "fable5-review.md #5. AudioTapManager.swift:22-31, ContentView.swift:107-113, AppDelegate.swift:30-32 all assume permission is granted on macOS 26 (CGPreflightScreenCaptureAccess lies there). If genuinely denied on a fresh install, taps use .mutedWhenTapped with banner hidden and all retry paths disabled — potential system-wide silence with no recovery. NEEDS MANUAL TESTING on macOS 26: tccutil reset ScreenCapture com.voltrol.Voltrol, relaunch, observe. If it silences audio: add post-start tap health check (input peak \u003e 0) with passthrough fallback + banner.",
+    "notes": "Uplift-3 (2026-07-16, main@50e05d8) sharpened this with code evidence — the never-granted case has NO recovery path on macOS 26: AppDelegate.swift:31-33 skips CGRequestScreenCaptureAccess entirely on \u003e=26 (no system prompt); ContentView.swift:108-113 force-hides the permission banner on 26; ProcessMonitor.swift:143+252-256 preflight always returns false on 26 so the grant transition can NEVER fire there; AudioTapManager uses .mutedWhenTapped assuming granted. Fresh macOS 26 install without TCC: no prompt, no banner, dead taps, no detector for a later grant. Spike question for the hardware session: does AudioHardwareCreateProcessTap fail or prompt without TCC on 26? Fix direction: drive banner + recovery off observed tap-start failures (TCC error code) instead of the lying preflight.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-07-04T15:05:34Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-07-16T13:33:57Z",
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "voltrol-x22",
+    "title": "Profile with Instruments Time Profiler",
+    "description": "Run Instruments Time Profiler on the running app with active audio to verify M1-M4 wins and find any remaining ≥5% hotpaths before further optimization.",
+    "acceptance_criteria": "Flamegraph captured, top 3 hotpaths documented",
+    "notes": "EXPANDED 2026-08-11 (epic voltrol-qv8). Original scope (verify M1-M4, find \u003e=5% hotpaths) is necessary but insufficient for the two live field bugs. Add these lanes to the session:\n- Energy Log / App Nap template, not just Time Profiler — the leading animation-stall hypothesis is App Nap throttling an LSUIElement agent (voltrol-qv8.5), which a CPU-time flamegraph will NOT show.\n- Animation Hitches + Core Animation FPS with the popover open and audio playing, to separate \"TimelineView paused\" from \"TimelineView running but starved\".\n- Points of Interest: run AFTER voltrol-qv8.1 lands the os_signpost regions. MetricSubscriber.swift:24 already lists signpostMetrics as collected, but the app emits zero signposts today, so the trace has no app-level landmarks and the lane is empty.\n- Capture a trace DURING a slider drag and during a right-click menu (voltrol-qv8.4: all timers are .default-mode and stop in tracking loops) — the stall is visible live, no long soak needed.\n- Capture a trace across an output-device switch (voltrol-qv8.7).\nPrefer running this after the soak (voltrol-qv8.2) has narrowed the window, so the Instruments session targets a known-bad moment rather than fishing.",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "estimated_minutes": 30,
+    "created_at": "2026-06-19T14:06:30Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-11T10:11:22Z",
+    "labels": [
+      "next-action",
+      "perf"
+    ],
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "voltrol-3ak.9",
+    "title": "Accessibility and appearance fallbacks: Reduce Transparency, Increase Contrast, Reduce Motion, light mode",
+    "description": "A glass aesthetic has four ways to become unusable, and all four are settings real people actually turn on. This bead is not optional polish — shipping the revamp without it makes the app worse for the users who most need it to be legible.\n\n1. REDUCE TRANSPARENCY (accessibilityReduceTransparency). Every material must resolve to a solid, opaque surface with enough contrast to stand alone. This is why the material tokens branch internally rather than being checked at call sites — otherwise every new view is a new place to forget.\n\n2. INCREASE CONTRAST (accessibilityIncreaseContrast). Hairline strokes and low-contrast secondary labels are exactly what this setting exists to fix. Strokes go opaque and full-width, secondary text goes to primary, and the quiet type scale gets louder.\n\n3. REDUCE MOTION (accessibilityReduceMotion). Already honoured in one place only — WaveformView.swift:227 pauses its TimelineView. Nothing else in the app reads it. Everything the motion bead adds needs a reduced counterpart, and the status-bar bolt flash needs a decided answer: recommendation is that Reduce Motion parks it static-lit rather than flashing, since a repeating menu-bar animation is precisely the category the setting targets.\n\n4. LIGHT MODE. The reference is dark. A translucent dark panel over a light wallpaper can turn into unreadable grey soup. Either the materials adapt properly to light appearance or the panel is deliberately pinned dark — decide it explicitly and record the decision, do not discover it in the field.\n\nAlso verify VoiceOver across the new controls. The custom slider bead owns its own VoiceOver implementation; this bead verifies the whole panel reads coherently end to end rather than as a pile of unlabelled shapes.",
+    "design": "Fallbacks belong inside the tokens, not at call sites. A view should never contain an if reduceTransparency branch — it asks for Design.Material.panel and gets the right thing.",
+    "acceptance_criteria": "All four settings toggled manually with screenshots on file; text meets contrast requirements under Increase Contrast; no animation runs under Reduce Motion; panel legible in light appearance over a light wallpaper; VoiceOver traverses the full panel with meaningful labels.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-14T15:20:31Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-14T15:20:31Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-3ak.9",
+        "depends_on_id": "voltrol-3ak.8",
+        "type": "blocks",
+        "created_at": "2026-08-14T11:21:14Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-3ak.9",
+        "depends_on_id": "voltrol-3ak.2",
+        "type": "blocks",
+        "created_at": "2026-08-14T11:21:13Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-3ak.9",
+        "depends_on_id": "voltrol-3ak",
+        "type": "parent-child",
+        "created_at": "2026-08-14T11:20:31Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 2,
+    "dependent_count": 0,
+    "comment_count": 0,
+    "parent": "voltrol-3ak"
+  },
+  {
+    "id": "voltrol-3ak.8",
+    "title": "Motion language: popover present/dismiss, row insert/remove, hover and press feedback",
+    "description": "The entire motion vocabulary today is one line: Design.Animation.standard = easeInOut(duration: 0.18), used by HoverRowModifier and little else. A glass aesthetic without motion reads as a static wallpaper screenshot.\n\nWORK:\n- Popover present and dismiss: a scale-and-fade with a slight spring, originating from the status item so it feels attached to the bolt rather than teleporting into place.\n- Row insert and remove: apps appear and disappear as they start and stop producing audio. Needs a defined transition, not the default snap.\n- Hover and press: the card lift and stroke brighten from the row bead need a curve of their own, faster than the present curve.\n- Value change: slider and level changes should interpolate, not jump.\n\nTHE TRAP, and it is why this bead is scheduled after the row work rather than alongside it: rows are level-tier sorted and re-ranked on every invalidateFilteredAppsCache (AudioState.computeFilteredApps, AudioState.swift:123-138). Row identity churns as levels move, so a naive insert/remove transition will fire on every reorder and look like flicker rather than motion. Either stabilise identity or scope the transition to genuine add/remove only. Verify with several apps playing simultaneously at varying levels, which is the case that breaks it — a single playing app will look fine and prove nothing.\n\nREDUCE MOTION: every animation added here must honour accessibilityReduceMotion. WaveformView already reads it (:227) and the rest of the app does not. Handled in the accessibility sibling bead, but do not add motion here that has no reduced counterpart.",
+    "design": "All curves live in Design.Motion. No literal durations or easings in view files. Present and dismiss are asymmetric — dismissal should be faster than presentation, which is what makes a UI feel responsive rather than sluggish.",
+    "acceptance_criteria": "Popover animates in and out from the status item; row add/remove animates without firing on level reorder, verified with 4+ apps playing at different levels; hover/press/value-change all animated; every animation has a Reduce Motion path.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-14T15:20:30Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-14T15:20:30Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-3ak.8",
+        "depends_on_id": "voltrol-3ak.4",
+        "type": "blocks",
+        "created_at": "2026-08-14T11:21:13Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-3ak.8",
+        "depends_on_id": "voltrol-3ak",
+        "type": "parent-child",
+        "created_at": "2026-08-14T11:20:30Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 1,
+    "comment_count": 0,
+    "parent": "voltrol-3ak"
+  },
+  {
+    "id": "voltrol-3ak.7",
+    "title": "Waveform visual language: glass-native rendering to replace the flat helix stroke",
+    "description": "User: \"animations do not work, would like to update that aesthetic as well while voltrol is open.\" Two separate things are bundled in that sentence and both need naming.\n\nPART ONE — they do not work. That is NOT a design problem and is not fixed here. It is epic voltrol-qv8, specifically qv8.4 (all timers are RunLoop.Mode.default so animations freeze during any AppKit tracking loop), qv8.5 (zero App Nap mitigation on an LSUIElement agent that genuinely idles), and qv8.6 (the isActive latch is self-sealing — TimelineView pause at WaveformView.swift:227 depends on the very clock that may have stopped, with no watchdog). Restyling a stalled animation produces a prettier stall. Those land first.\n\nPART TWO — the aesthetic, which is this bead. Current rendering in Voltrol/Views/WaveformView.swift: a dual-helix built by buildHelixPaths(size:phase:amplitude:) at :303-353 and drawn by drawHelix(ctx:size:phase:amplitude:glowPass:) at :355-390, in cyan (0.0/0.90/1.0) plus the accent orange, inside a TimelineView(.animation) Canvas. It already has a glowPass, so the bones of a luminous treatment exist.\n\nTARGET: the reference language is quiet and luminous — soft bloom rather than hard neon, gradient strokes rather than flat colour, and accent used sparingly. Concretely: gradient-filled strokes instead of solid colour, a wider soft bloom pass under a crisp core stroke, translucency so the glass panel behind reads through the waveform, and an amplitude response that feels physical rather than linear.\n\nDEPENDS ON voltrol-qv8.9, which introduces the waveform STYLE SYSTEM (spectrum bars, oscilloscope trace, filled mountains, radial pulse, minimal bar). That bead builds the pluggable renderer architecture; this bead defines the glass visual language every style renders in. Building the look before the architecture means porting it N times.\n\nDO NOT TOUCH the menu-bar bolt. That is voltrol-4jm protected identity and is handled by its own sibling bead. qv8.9 already excludes it.\n\nPIN: buildHelixPaths is covered by testBench_04_HelixPathOps in VoltrolTests/PerformanceBenchmarks.swift. A bloom pass costs fill rate — verify the benchmark rather than assuming a Canvas change is free.",
+    "design": "Visual language is defined once as tokens (Design.Glow, gradient stroke tokens) and consumed by every style renderer, so adding a style later does not mean re-deriving the look.",
+    "acceptance_criteria": "Waveform renders with gradient strokes and a soft bloom that reads as glass over the panel; the panel is visible through it; qv8.9 style renderers all adopt the language without per-style special-casing; testBench_03 and testBench_04 within their existing baselines.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-14T15:19:48Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-14T15:19:48Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-3ak.7",
+        "depends_on_id": "voltrol-qv8.4",
+        "type": "blocks",
+        "created_at": "2026-08-14T11:21:12Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-3ak.7",
+        "depends_on_id": "voltrol-3ak.2",
+        "type": "blocks",
+        "created_at": "2026-08-14T11:21:10Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-3ak.7",
+        "depends_on_id": "voltrol-qv8.9",
+        "type": "blocks",
+        "created_at": "2026-08-14T11:21:11Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-3ak.7",
+        "depends_on_id": "voltrol-3ak",
+        "type": "parent-child",
+        "created_at": "2026-08-14T11:19:47Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 3,
+    "dependent_count": 0,
+    "comment_count": 0,
+    "parent": "voltrol-3ak"
+  },
+  {
+    "id": "voltrol-3ak.5",
+    "title": "Controls: custom glass slider, mute affordance, and pill chips for device/secondary controls",
+    "description": "The controls are stock AppKit-through-SwiftUI and are the loudest tell that this is not a designed app. AppVolumeRow.swift and MasterVolumeView.swift both use a plain Slider; the device picker and secondary controls have no glass treatment.\n\nSLIDER: the reference language wants a custom track — a recessed translucent groove, a filled portion carrying the accent as a gradient rather than a flat bar, and a thumb that reads as a small glass bead with its own stroke and shadow. SwiftUI Slider is not stylable to this degree on macOS, so this needs a custom control built on a drag gesture over a shaped track.\n\nRISK, and it is the reason this bead is not trivial: replacing Slider means reimplementing keyboard control, accessibility (VoiceOver value/increment/decrement), scroll-wheel adjustment, and click-to-position. A pretty slider that VoiceOver cannot drive is a regression, not a feature. Budget for the accessibility work explicitly.\n\nSECOND RISK: the custom slider must not make the existing timer stall worse. All timers are RunLoop.Mode.default only (bd memory all-timers-are-default-runloop-mode, voltrol-qv8.4), so waveforms already freeze during a slider drag. A hand-rolled gesture-driven control changes the tracking behaviour — verify against qv8.4 rather than assuming it is unaffected.\n\nMUTE: currently a plain button. Wants a state-carrying glass affordance where muted is visually unmistakable at a glance, not a subtle icon swap.\n\nCHIPS: the reference uses compact glass pills with an icon plus a short label for secondary controls. The output-device picker is the natural fit, along with any status badge. Fully rounded, low contrast, small type.",
+    "design": "Build the slider as one reusable control used by both the master and the per-app rows, so there is one accessibility implementation and one visual definition rather than two that drift.",
+    "acceptance_criteria": "Custom slider used in both master and rows; VoiceOver reads and adjusts values; keyboard arrows and scroll-wheel work; click-to-position works; mute state unmistakable; device picker renders as a glass pill; qv8.4 drag behaviour verified not regressed.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-14T15:19:02Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-14T15:19:02Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-3ak.5",
+        "depends_on_id": "voltrol-3ak",
+        "type": "parent-child",
+        "created_at": "2026-08-14T11:19:01Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-3ak.5",
+        "depends_on_id": "voltrol-3ak.2",
+        "type": "blocks",
+        "created_at": "2026-08-14T11:21:09Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 1,
+    "comment_count": 0,
+    "parent": "voltrol-3ak"
+  },
+  {
+    "id": "voltrol-3ak.4",
+    "title": "Restyle app rows and master section as layered glass cards",
+    "description": "Second elevation layer. The reference nests cards inside the outer panel, each with its own fill, its own hairline stroke, and its own shadow — depth from stacked translucency rather than from heavier shadows.\n\nFILES: Voltrol/Views/AppVolumeRow.swift and Voltrol/Views/MasterVolumeView.swift. Both are currently flat: plain rows, an Image(nsImage:) app icon, a stock Slider, and .hoverRow() whose entire treatment is a 5 percent primary background swap (HoverRowModifier in DesignConstants.swift).\n\nWORK:\n- Each app row becomes a card at Design.Elevation 1: translucent fill, top-lit hairline stroke, medium corner radius, generous internal padding.\n- Hover becomes a real state — fill lifts, stroke brightens, and an accent glow appears — replacing the flat 5 percent wash. Must stay subtle; the reference is quiet.\n- The master section reads as the primary card, visually distinct from the per-app cards, not merely a row with a different label.\n- App icons want a container treatment (rounded, inset, faintly lit) so a mixed set of macOS app icons reads as a coherent stack instead of a ransom note.\n- Playing versus silent should be legible at a glance — a small accent indicator, in the reference language where accent colour appears as small dots and never as large fills. This is the in-popover twin of the status-icon activity work and should read from the same signal.\n\nWATCH OUT: rows are level-tier sorted and re-ranked on every cache invalidation (AudioState.computeFilteredApps, AudioState.swift:123-138). Row identity therefore churns, so any card enter/exit animation will fire on reorder and can look like flicker. Coordinate with the motion bead — do not add per-row transitions without addressing identity stability first.",
+    "design": "Cards read from Design.Elevation and Design.Material only. No literal radii or opacities in the view files.",
+    "acceptance_criteria": "Rows and master render as nested glass cards with hover states; icons visually coherent; playing state legible; no flicker on level-tier reorder; layout stays within panelMaxHeight without a ScrollView.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-14T15:19:01Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-14T15:19:01Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-3ak.4",
+        "depends_on_id": "voltrol-3ak",
+        "type": "parent-child",
+        "created_at": "2026-08-14T11:19:00Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-3ak.4",
+        "depends_on_id": "voltrol-3ak.2",
+        "type": "blocks",
+        "created_at": "2026-08-14T11:21:08Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 2,
+    "comment_count": 0,
+    "parent": "voltrol-3ak"
+  },
+  {
+    "id": "voltrol-3ak.3",
+    "title": "Popover shell: floating glass panel, custom chrome, and the NSPopover-vs-NSPanel question",
+    "description": "The container is what sells the aesthetic. Right now it is a stock NSPopover created bare at StatusItemController.swift:32 with popover.behavior = .transient at :34, and no material, appearance, or visual-effect configuration anywhere in the file.\n\nTHE PROBLEM WITH NSPOPOVER: it draws its own chrome — an arrow pointing at the status item, a system-chosen background, and a fixed corner radius. That chrome fights a custom glass panel. The reference screenshot shows free-floating rounded rectangles with no arrow and no visible system frame. Two ways out:\n1. Keep NSPopover and defeat its chrome. Set contentViewController background to clear, host an NSVisualEffectView, and either accept the arrow or suppress it. Cheap, but it fights the framework and has historically broken across OS revisions.\n2. Replace with a borderless non-activating NSPanel positioned under the status item. Full control over shape, shadow, and material; costs us the transient dismiss behaviour, keyboard focus handling, and screen-edge repositioning that NSPopover gives free, all of which then have to be reimplemented and tested.\n\nRecommendation is 1 unless the arrow proves unremovable, because the dismiss and focus semantics NSPopover provides are more work to rebuild correctly than the visual gain justifies. Decide with a spike, not in the abstract.\n\nVISUAL TARGET: outermost panel is translucent over the desktop with real behind-window blur so the wallpaper shifts through it, a hairline top-lit stroke, a large corner radius, and a soft wide shadow. Panel width stays at Design.Size.panelWidth 340 unless the layout demands otherwise.\n\nHARD CONSTRAINT: no ScrollView in the popover. That is a documented UX decision (PROJECT_CONTEXT.md:164-165, voltrol-7yd) and reversing it needs the user sign-off. If the glass treatment pushes content past panelMaxHeight 680, solve it with density, not with a scroll view.",
+    "design": "Behind-window blending is required — .withinWindow blur samples the app content and will look like frosted grey, not like glass over a wallpaper. That single setting is the difference between the reference look and a washed-out panel.",
+    "acceptance_criteria": "Popover renders as a floating translucent panel with the desktop visible through it; no stock chrome visible; transient dismiss still works; no ScrollView added; opens with no perceptible delay.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-14T15:19:00Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-14T15:19:00Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-3ak.3",
+        "depends_on_id": "voltrol-3ak",
+        "type": "parent-child",
+        "created_at": "2026-08-14T11:18:59Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-3ak.3",
+        "depends_on_id": "voltrol-3ak.2",
+        "type": "blocks",
+        "created_at": "2026-08-14T11:21:08Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 1,
+    "comment_count": 0,
+    "parent": "voltrol-3ak"
+  },
+  {
+    "id": "voltrol-3ak.2",
+    "title": "Design token layer: materials, elevation, stroke, radius, shadow, glow, and motion curves",
+    "description": "Voltrol/Design/DesignConstants.swift is the entire design system today and it is 40 lines: enum Spacing (xs 4 / sm 8 / md 14 / lg 20 / xl 28), enum Size (iconSize 20, panelWidth 340, panelMaxHeight 680), enum Color (accent orange 0.976/0.451/0.086, rowHover primary@5pct, divider primary@7pct, sliderTint, mutedTint), one Font.label helper with design: .rounded, one Animation.standard of easeInOut 0.18s, and HoverRowModifier.\n\nThere is no vocabulary for anything the reference screenshot is made of. Missing entirely: material/blur, elevation levels, border strokes, corner radii, shadows, glows, and any motion curve beyond a single easeInOut.\n\nWHAT TO ADD:\n- Design.Material — panel (outermost translucent surface), card (nested surface at second elevation), chip (small pill), each resolving to the API chosen in the strategy decision bead, with a Reduce Transparency fallback baked into the token rather than checked at call sites.\n- Design.Elevation — an ordered scale (0/1/2) where each step composes a fill opacity, a stroke, and a shadow. Depth in the reference comes from stacking translucency, not from dropping heavier shadows, so the scale must encode that.\n- Design.Stroke — hairline borders. The single detail that separates convincing glass from a blurred rectangle is a 1px inner stroke that is brightest at the TOP edge and fades toward the bottom, simulating light from above. That means a LinearGradient stroke token, not a flat colour.\n- Design.Radius — sm/md/lg/pill. The reference uses generous radii, roughly 10 for chips, 16-20 for cards, and fully rounded pills.\n- Design.Glow — accent bloom for active/playing states, used sparingly.\n- Design.Motion — named curves for present, dismiss, hover, press, and value-change, replacing the lone 0.18s easeInOut.\n- Design.Color — extend with the layered translucent fills and secondary label tiers the glass language needs. Keep the existing orange accent as the sparse indicator colour it is in the reference, not as a large fill.\n\nCONSTRAINT: this bead adds tokens and may migrate existing call sites to them, but it does not restyle anything. Visual change lands in the surface beads so that a regression is attributable to one bead.",
+    "design": "One file, additive. Existing token names stay valid so the diff in the view files is mechanical. Every token must be resolvable under Reduce Transparency and Increase Contrast without a conditional at the call site — the token itself branches.",
+    "acceptance_criteria": "DesignConstants.swift exposes Material/Elevation/Stroke/Radius/Glow/Motion; no view file contains a literal corner radius, blur, shadow, or stroke colour; build green; PerformanceBenchmarks unchanged.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-14T15:18:17Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-14T15:18:17Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-3ak.2",
+        "depends_on_id": "voltrol-3ak",
+        "type": "parent-child",
+        "created_at": "2026-08-14T11:18:16Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-3ak.2",
+        "depends_on_id": "voltrol-3ak.1",
+        "type": "blocks",
+        "created_at": "2026-08-14T11:20:57Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 5,
+    "comment_count": 0,
+    "parent": "voltrol-3ak"
+  },
+  {
+    "id": "voltrol-3ak",
+    "title": "[epic] Liquid Glass revamp: futuristic glossy chrome, motion language, and activity-driven status icon",
+    "description": "User-requested visual overhaul (2026-08-14, reference screenshot supplied). Target aesthetic is the macOS Tahoe / Liquid Glass language: dark translucent panels floating over the desktop, heavy background blur with real vibrancy, generous corner radii, hairline light-catching strokes, layered depth via stacked translucency + soft shadow, and small glass pill/chip affordances for secondary controls.\n\nWHAT THE REFERENCE ACTUALLY SHOWS (extracted, so nobody re-derives it):\n- Panels are translucent over the wallpaper, not opaque grey — the desktop image reads through at roughly 15-25% and shifts as content moves behind it.\n- Every surface has a 1px inner stroke slightly lighter than its fill, brightest at the top edge (simulated light from above). This single detail is what makes it read as glass rather than as a blurred rectangle.\n- Cards are layered: an outer panel, then inner cards at a second elevation with their own fill + stroke + shadow. Depth comes from stacking translucency, not from heavy drop shadows.\n- Secondary controls are glass pills with an icon + short label (model picker, \"High\", \"Fast\", \"Supervised\"). Compact, low-contrast, rounded fully.\n- Type is quiet: small, medium weight, low-contrast secondary labels, monospace only where semantically code.\n- Accent colour is used sparingly as small dots/indicators, never as large fills.\n\nCURRENT STATE — the gap is large. Voltrol/Design/DesignConstants.swift is the entire design system: 5 spacing values, 5 colours, one .rounded font helper, one 0.18s easeInOut, and a hover-row modifier. There are NO tokens for material, elevation, stroke, corner radius, shadow, glow, or motion. Nothing in the app uses .ultraThinMaterial, NSVisualEffectView, or any glass API. The popover is a stock NSPopover (StatusItemController.swift:32-34, .transient) with default system chrome.\n\nSCOPE ALSO INCLUDES (user asked explicitly):\n- Animations are currently broken in the field — that is epic voltrol-qv8, which must land FIRST or the new motion language will be built on a stalled clock and will appear to fail for reasons that have nothing to do with the design.\n- The menu-bar bolt must reflect AUDIO ACTIVITY, not popover visibility: charging/animated when sources are playing, static when silent. See the child bead — this is a behavioural change, not a styling one.\n\nHARD CONSTRAINT — DEPLOY TARGET: project.yml pins macOS 14.2 (three sites: :16-17, :41-42, :64-65). Native Liquid Glass is macOS 26+. The strategy decision is a blocking child bead; nothing visual starts before it is answered.",
+    "design": "Token layer first, surfaces second, motion third. Every visual bead must read from expanded Design tokens — no ad-hoc colours, radii, or blurs at call sites. The current file is small enough that expanding it properly now costs less than retrofitting later.",
+    "acceptance_criteria": "Popover renders in the glass language on the chosen deploy target with a documented non-glass fallback; the status icon animates iff audio is playing; Reduce Transparency and Increase Contrast both degrade gracefully; PerformanceBenchmarks stay green.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "epic",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-14T15:15:38Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-14T15:15:38Z",
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "voltrol-qv8.9",
+    "title": "Waveform style system — pluggable sound animations beyond the dual helix",
+    "description": "STRETCH GOAL from the 2026-08-11 session. Today there is exactly one visualization and it is hard-coded: Voltrol/Views/WaveformView.swift draws a dual helix (two mirrored sine strands, cyan + orange, with white crossing sparks and a blurred glow pass). Geometry is a static pure function, buildHelixPaths (:303-353), and drawHelix (:355-390) does the styling. The data source is already fully decoupled — WaveformModel is a 60-sample circular buffer at 20Hz (:106-171) with a plain () -\u003e Float provider, so ANY renderer can read it unchanged.\n\nWork is therefore mostly extraction, not invention:\n1. Introduce a style abstraction (enum + a render function taking GraphicsContext, size, phase, amplitude, glowPass, plus the sample buffer for styles that need history rather than a single amplitude). Keep buildHelixPaths as the reference implementation and the helix as the default.\n2. Expose the sample buffer read-only for history-based styles — WaveformModel.samples is currently private with only recentAverage(count:) exposed (:129-139). Add an accessor that does not allocate per frame.\n3. Persist the choice (VolumeStore idiom) and add a picker. UI placement is a UX call — probably the right-click context menu rather than the popover, since the popover deliberately has no ScrollView (PROJECT_CONTEXT.md:164-165, voltrol-7yd) and must not grow.\n\nCandidate styles (name the shortlist before building all of them):\n- Spectrum bars — classic N-bar meter. Cheapest to draw, most legible at 22pt height, most conventional.\n- Oscilloscope trace — single scrolling line from the actual sample history rather than a synthesized sine. This is the one that would show REAL waveform shape; the helix is decorative (a sine whose amplitude is audio-driven, not the signal itself).\n- Filled mountains — area chart of the sample buffer, mirrored or not.\n- Radial pulse / orb — level-driven ring, no horizontal scroll. Best fit if a compact row variant is ever needed.\n- Minimal bar — a plain level bar, near-zero cost. Doubles as a low-power and accessibility option, and a better reduceMotion target than the current 1Hz-sampled helix.\n\nCONSTRAINTS:\n- The MENU-BAR BOLT flash (bolt \u003c-\u003e bolt.fill image swap, 0.9s) is NOT in scope and must not be touched — protected product identity, voltrol-4jm and a pinned bd memory. This bead is about the in-popover waveforms only.\n- Perf gate: PerformanceBenchmarks testBench_03_WaveformUpdate and testBench_04_HelixPathOps plus PerformanceBaseline.json pin the helix path-element contract. Refactoring must keep those green, and each new style needs its own bench entry so a cheap-looking style cannot silently cost more than the helix.\n- Per-row cost is already a known scaling concern (voltrol-7yd: O(N) rows, each with a 30fps TimelineView). A new style must not be more expensive per frame than the helix without that being an explicit, measured decision.",
+    "design": "Do the extraction as a behavior-preserving refactor FIRST, with the helix as the only style and benches green, and land it separately from any new style. That keeps the risky part (touching a perf-pinned render path) isolated from the fun part.",
+    "acceptance_criteria": "At least two styles selectable and persisted across relaunch; helix remains the default and is pixel-identical to today; testBench_03/04 green against the existing baseline; each new style has its own benchmark entry.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "feature",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-11T10:10:58Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-11T10:10:58Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-qv8.9",
+        "depends_on_id": "voltrol-qv8",
+        "type": "parent-child",
+        "created_at": "2026-08-11T06:10:57Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 1,
+    "comment_count": 0,
+    "parent": "voltrol-qv8"
+  },
+  {
+    "id": "voltrol-qv8.8",
+    "title": "[bug] handleDeviceChange early-return can strand the app in a wrong-route state with no reconcile path",
+    "description": "Second, quieter failure mode on the same path, and the one that best explains \"does not work right away\" as opposed to \"never works\".\n\nAudioState.handleDeviceChange() (AudioState.swift:330-331) guards:\n  guard let newDefault = outputDevices.first(where: \\.isDefault), newDefault.uid != currentTapOutputUID else { return }\n\nThe isDefault flag comes from AudioObjectID.readOutputDeviceList() refreshed one line earlier. The listener block fires for BOTH kAudioHardwarePropertyDevices and kAudioHardwarePropertyDefaultOutputDevice and is debounced 0.05s into a single call (AudioState.swift:283-289,316-321). On a monitor coming back, the device-list notification and the default-device change are not simultaneous. If the collapsed call reads the list while the default has not settled, first(where: \\.isDefault) yields the OLD device, the guard returns early, and currentTapOutputUID is never advanced.\n\nThe app is now in a state it believes is consistent: currentTapOutputUID matches what it thinks the default is, aggregates point at the old device, and NOTHING re-checks. There is no periodic reconcile — ProcessMonitor polls the process list every 10s (ProcessMonitor.swift:122) but never validates the audio ROUTE. So the wrong route persists until the next genuine device change, which is exactly the \"switch away and back again to fix it\" workaround shape.\n\nCompounding: the 0.05s debounce timer is itself .default-mode (see voltrol-qv8.4), so switching output from a menu can delay the whole sequence until menu tracking ends.\n\nFix direction: (a) read the default device DIRECTLY via readDefaultOutputDevice() for the guard instead of inferring it from the list snapshot, so the two cannot disagree; and/or (b) add a cheap route reconcile to the existing 10s poll — if the current default output UID != currentTapOutputUID, restart. That single safety net makes every miss self-healing within 10s regardless of which race caused it.",
+    "design": "The reconcile is the higher-value half: it is a few lines, has no new timer, is not device-specific, and closes the whole class of missed-notification races rather than one instance. Must not fight the existing self-generated-notification suppression that the guard exists to provide — compare against the real HAL default, not against the device list.",
+    "acceptance_criteria": "A headless test using the existing injectable device seams (OutputDeviceSwitchingTests covers this area) drives a change where the list snapshot lags the default, asserts the early return happens, then asserts the reconcile path restarts taps on the following poll.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "bug",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-11T10:10:24Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-11T10:10:24Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-qv8.8",
+        "depends_on_id": "voltrol-qv8",
+        "type": "parent-child",
+        "created_at": "2026-08-11T06:10:24Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-qv8.8",
+        "depends_on_id": "voltrol-qv8.3",
+        "type": "blocks",
+        "created_at": "2026-08-11T06:11:00Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 1,
+    "comment_count": 0,
+    "parent": "voltrol-qv8"
+  },
+  {
+    "id": "voltrol-upr",
+    "title": "Docs \u0026 DX epic: make Voltrol legible to humans and agents (CLAUDE.md philosophy, spec+diagrams, Nextra site, pipeline docs)",
+    "description": "Make Voltrol fully legible to both humans and agents: a new contributor (human or LLM) should be able to understand WHAT this product is, WHY it is built the way it is, and HOW to work on it safely — without archaeology through git history or session transcripts.\n\n## Why this epic exists\nThe repo is operated primarily by agents executing plans. Today the durable knowledge lives scattered: CLAUDE.md (build/arch/conventions — upgraded in PR #29, but no product/philosophy layer), PROJECT_CONTEXT.md (partially stale — wrong ownership map, File Map missing StatusItemController/VolumeStore/ProcessListResolver/WaveformView), plans/001-014 (excellent but per-change), BUGS.md, bd memories, and tribal knowledge (the intentional flash animation, the no-ScrollView decision, RT-thread discipline, the seam-injection idiom, macOS 26 TCC lies). Wrong or missing docs cost every future session tokens and mistakes.\n\n## What \"done\" looks like for the epic\n1. CLAUDE.md carries the product/purpose/philosophy layer (child bead) — the \"why\", not just the \"how\".\n2. A clean spec + diagrams describe the system (child bead) — component map, audio data path, tap lifecycle state machine, permission flows; PROJECT_CONTEXT.md corrected.\n3. A Nextra documentation website builds from the repo and publishes via GitHub Pages (child bead) — user-facing (install, permissions, troubleshooting) + contributor-facing (architecture, conventions).\n4. The automated test + release chain is documented end-to-end (child bead) — CI, auto-tag → release.yml, signing/notarization/SBOM/attestation, the g16 secrets runbook.\n\n## Standing goals this epic encodes (what agents strive for)\n- Automated tests green at every gate (currently 307-317 headless + opt-in TCC hardware lanes); never claim done without running them.\n- Automated releases via GitHub (auto-tag → release.yml; sole blocker: voltrol-g16 secrets).\n- Every non-trivial change flows plan → code → independent judge, with model verification.\n- RT-thread invariants are inviolable; live-system writes get injectable seams; intentional product behavior (voltrol-4jm flash) is protected by pinned tests.\n",
+    "design": "Four children, ordered: (1) CLAUDE.md philosophy layer, (2) spec+diagrams+PROJECT_CONTEXT fix, (3) Nextra site (depends on 1+2 for content), (4) pipeline docs. Docs-only epic — zero source-code changes.",
+    "acceptance_criteria": "All four child beads closed; a fresh agent session can answer 'what is this product, why is it designed this way, how do I build/test/release it' from committed docs alone; docs site deploys green from main",
+    "notes": "Filed 2026-07-16 at user request. PR #29 (unmerged) already carries the CLAUDE.md build/arch/conventions layer — child 1 builds ON that, does not duplicate it.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "epic",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-07-17T02:39:36Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-07-17T02:39:36Z",
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "voltrol-kw9",
+    "title": "Tap start failures are invisible in the UI and never retried for stable apps",
+    "description": "A tap whose start() failed renders an identical, live-looking row: the slider drags call userStateChanged into a .idle controller and nothing happens; audioLevel reads 0. Silent functional failure with no user signal and no retry.\n\nEvidence (main@50e05d8): AudioTapManager.swift:135-143 — new-app controllers registered even when start() fails (documented anti-loop tradeoff); :163-167 — materialize() discards start()'s result; :879-899 — failure leaves the controller .idle forever. Recovery only via permission grant, device switch, or a process-set change — a transient failure (coreaudiod busy, device mid-transition) for a stable app never retries. UI: AppVolumeRow renders no degraded state.\n\n## Steps to Reproduce\n1. Cause a transient tap-creation failure for one app (e.g. coreaudiod under churn during creation), or stub start() to fail once.\n2. Observe the row renders normally; slider moves do nothing; no log-visible retry ever happens for that app while its process set is stable.\n\n## Expected Behavior\nA dead tap is visibly degraded in the row (dimmed slider / warning glyph), and a bounded retry (e.g. once, N polls later) recovers transient failures without reintroducing the create-fail-recreate loop the current design deliberately avoids.\n\n## Actual Behavior\nRow looks live, controls do nothing, permanent until an unrelated event coincidentally rebuilds the fleet.\n",
+    "design": "Add startFailed/isLive on ProcessTapController; updateTaps retries at most once N polls later; AppVolumeRow dims + warning glyph when not live. MED risk: retry must not reintroduce the churn loop — cap attempts. Needs a small design pass on the UI treatment before implementation.",
+    "acceptance_criteria": "A controller whose start() failed exposes a degraded state; AppVolumeRow renders it distinctly; at most one bounded retry fires on a later poll for .idle-after-failed-start controllers; the anti-loop property (no create-fail-recreate churn per poll) is preserved and pinned by a test.",
+    "notes": "Risk: MED. Effort: M. Found by uplift-3 (UI/resilience lens) at 50e05d8. Filed as bead-only (no plan) — design pass first. Written by /uplift.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "bug",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-07-16T13:33:57Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-07-16T13:33:57Z",
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "voltrol-ewa",
+    "title": "Pin release toolchain + GitHub host key — unpinned brew/gem run before signing",
+    "description": "The release/signing job installs unpinned build+packaging tooling from live Homebrew and RubyGems during the signed-release run, and trusts GitHub's SSH host key via live ssh-keyscan before pushing the Homebrew tap — a supply-chain choke point that the SHA-pinned Actions otherwise close. `release.yml:24-27` runs `brew install xcodegen create-dmg cosign` and `gem install xcpretty --no-document` with no version pins; those tools produce the artifact BEFORE signing/notarization/Sigstore/attestation (:30-57, :187-200). The attestations then prove the artifact came from this workflow, but the workflow depended on unreviewed tool versions resolved at release time — a bad/compromised formula or gem gets amplified into a signed, notarized, distributed macOS artifact. Separately, `release.yml:235-242` loads the tap deploy key and trusts GitHub's host key from live `ssh-keyscan github.com` (TOFU — no pinned fingerprint) before cloning+mutating the public tap.\n\n## Impact / Why this matters\nProvenance covers the artifact but not the toolchain that built and packaged it. This is the one place where an unpinned dependency becomes a signed release with a Developer ID identity and a Homebrew cask update — high blast radius, low reversibility. Distinct from CI (which is unsigned).\n\n## Proposed direction (needs human decision — do not auto-implement)\n- Pin the toolchain: install xcodegen/create-dmg/cosign at explicit versions (or vendor/prebuild them), and pin xcpretty's gem version; ideally verify checksums.\n- Replace live `ssh-keyscan github.com` with a pinned known_hosts entry (GitHub publishes its host key fingerprints).\n- Consider moving tool acquisition to a separate, reviewed step whose output is verified before the signing steps run.\n\nAcceptance sketch: release job installs only pinned/verified tool versions before archiving/signing; the tap-push step uses a pinned GitHub host key rather than TOFU. (No headless test possible — the release workflow cannot run outside a tagged release; this is a review-and-pin change, verified by inspecting the workflow + a dry-run tag on a fork.)\n",
+    "design": "Pin/vendor the toolchain and gem versions (ideally checksum-verified); replace ssh-keyscan github.com with GitHub's published host-key fingerprint. Review-and-pin change; no headless test — release runs only on a tag.",
+    "acceptance_criteria": "release.yml installs only pinned/verified tool versions (xcodegen/create-dmg/cosign/xcpretty) before archiving+signing; the Homebrew-tap push uses a pinned GitHub known_hosts entry instead of live ssh-keyscan TOFU; verified by workflow inspection + a fork dry-run tag",
+    "notes": "Risk: MED (touches signed release path — human decision + review required, do NOT auto-implement). Effort: M. Found in /uplift cycle-2. Written by /uplift.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-07-11T13:56:43Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-07-11T13:56:43Z",
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "voltrol-a8q",
+    "title": "Auto-tag → release chain broken: bot-pushed tags don't trigger release.yml",
+    "description": "GitHub's GITHUB_TOKEN anti-recursion rule means tags pushed by auto-tag.yml (github-actions[bot]) never trigger release.yml's on:push:tags. v0.1.0 (2026-07-05) had to be deleted and re-pushed manually to fire the release. Fix options: (a) give auto-tag a PAT/GitHub App token via secrets for the tag push, (b) add workflow_run or workflow_dispatch trigger to release.yml, or (c) have auto-tag invoke release via gh workflow run. Past v0.0.x releases worked because tags were pushed manually.",
+    "notes": "Code fix implemented and judged PASS (workflow_dispatch dispatch from auto-tag.yml). Bead intentionally left open/in-progress rather than closed: bd correctly flags this is blocked by voltrol-g16 (release secrets missing), since full end-to-end validation requires a real Auto-Tag cycle to actually produce a Release run without manual tag re-push — that can't be observed until g16 unblocks releases.",
+    "status": "in_progress",
+    "priority": 2,
+    "issue_type": "bug",
+    "assignee": "Rohit Gudi",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-07-05T16:42:52Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-07-13T17:53:43Z",
+    "started_at": "2026-07-13T17:41:44Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-a8q",
+        "depends_on_id": "voltrol-g16",
+        "type": "blocks",
+        "created_at": "2026-07-05T12:44:22Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-a8q",
+        "depends_on_id": "voltrol-9pp",
+        "type": "blocks",
+        "created_at": "2026-07-23T22:33:37Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 2,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "voltrol-3ak.10",
+    "title": "Visual QA and render-cost guard: reference screenshot set + confirm blur does not regress benchmarks",
+    "description": "A translucency-heavy redesign has a cost that microbenchmarks cannot see, and this project has already been bitten by measuring the wrong layer.\n\nRENDER COST. Behind-window blur, layered translucency, and a waveform bloom pass are all fill-rate work, repeated per frame while the popover is open. The existing suite cannot see it: VoltrolTests/PerformanceBenchmarks.swift contains only testBench_01_RTCallback_Steady, 02_RTCallback_Muted, 03_WaveformUpdate, 04_HelixPathOps, and 05_BinarySize — synthetic microbenchmarks in a test host, blind to compositing cost. Measure the real thing with Instruments Animation Hitches and the Core Animation lanes, on the machine with the display attached, popover open, several apps playing. Record numbers before and after so the regression is attributable.\n\nRELEVANT PRIOR ART: voltrol-qv8.1 adds os_signpost regions and qv8.2 adds scripts/soak.sh. Once those exist, popover-open frame cost should be a signposted region so it shows up in the soak rather than needing a manual Instruments session every time. Prefer extending that harness over building a second one.\n\nREFERENCE SCREENSHOTS. Capture the full visual state matrix and keep it in the repo so drift is reviewable in a PR: dark and light appearance, Reduce Transparency on and off, Increase Contrast on and off, zero apps, one app, and many apps, over both a busy and a plain wallpaper. Full automated snapshot testing on a translucent surface over live desktop content is not reliable — the wallpaper shows through and the comparison is inherently unstable — so this is a curated reference set for human review, not an assertion gate. Say so in the README next to it rather than letting someone later mistake it for a broken test.\n\nBINARY SIZE. testBench_05_BinarySize exists and has a baseline. A custom control layer plus new assets will move it. Update the baseline deliberately with the number stated, do not let it be discovered as a failure.",
+    "design": "Extend the qv8.1 signpost harness rather than adding a parallel measurement path. Screenshots are review material, not assertions — label them as such.",
+    "acceptance_criteria": "Before/after frame-cost numbers recorded from a real session with the popover open and audio playing; no dropped-frame regression while idle-open; reference screenshot matrix committed with a README stating it is for human review; testBench_05 baseline updated with the delta stated.",
+    "status": "open",
+    "priority": 3,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-08-14T15:20:32Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-08-14T15:20:32Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-3ak.10",
+        "depends_on_id": "voltrol-3ak.4",
+        "type": "blocks",
+        "created_at": "2026-08-14T11:21:15Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-3ak.10",
+        "depends_on_id": "voltrol-3ak.3",
+        "type": "blocks",
+        "created_at": "2026-08-14T11:21:15Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-3ak.10",
+        "depends_on_id": "voltrol-3ak.5",
+        "type": "blocks",
+        "created_at": "2026-08-14T11:21:16Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-3ak.10",
+        "depends_on_id": "voltrol-3ak",
+        "type": "parent-child",
+        "created_at": "2026-08-14T11:20:32Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 3,
+    "dependent_count": 0,
+    "comment_count": 0,
+    "parent": "voltrol-3ak"
+  },
+  {
+    "id": "voltrol-7x9",
+    "title": "Nextra documentation website, auto-published via GitHub Pages",
+    "description": "Stand up a Nextra documentation website for Voltrol, published automatically via GitHub Pages.\n\nScope:\n1. **Site scaffold** — Nextra (docs theme) under docs-site/ (or website/); pinned Node toolchain; must not interfere with the Xcode project or scripts/test.sh.\n2. **Content** (sourced from children 1+2 — do NOT hand-fork; import/transclude or keep single-sourced where possible):\n   - User docs: what Voltrol is, install (DMG when releases exist; build.sh --install meanwhile), granting Screen Recording (incl. macOS 26 quirks), troubleshooting (orphaned taps, --reset-audio, TCC).\n   - Contributor docs: architecture (the spec + diagrams from child 2), conventions, RT-thread rules, the plans/ + beads workflow, release pipeline.\n3. **Deploy** — GitHub Actions workflow building the site and publishing to GitHub Pages on push to main (path-filtered so app CI is untouched); repo Pages settings documented.\n4. **Quality bar** — landing page states the product promise in one sentence; navigation ≤ 2 levels; mermaid rendering enabled; dark mode (it's a menu-bar audio tool, the audience lives in dark mode).\n\nConstraints: zero impact on the Swift build; the site workflow must not run on app-only changes; keep dependencies minimal and pinned (this repo has supply-chain attestation standards — see release.yml).\n",
+    "design": "Nextra docs theme; GitHub Pages via actions/deploy-pages; path filters on docs-site/**. Content single-sourced from CLAUDE.md/docs/spec where feasible.",
+    "acceptance_criteria": "Site builds locally and deploys green from main via a path-filtered Pages workflow; user + contributor sections populated from children 1/2 content; mermaid renders; app CI unaffected by docs-only pushes",
+    "notes": "Effort: M. Child of epic voltrol-upr. Blocked by children 1+2 (content).",
+    "status": "open",
+    "priority": 3,
+    "issue_type": "feature",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-07-17T02:40:39Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-07-17T09:33:38Z",
+    "dependencies": [
+      {
+        "issue_id": "voltrol-7x9",
+        "depends_on_id": "voltrol-po7",
+        "type": "blocks",
+        "created_at": "2026-07-16T22:40:51Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-7x9",
+        "depends_on_id": "voltrol-upr",
+        "type": "parent-child",
+        "created_at": "2026-07-16T22:40:49Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "voltrol-7x9",
+        "depends_on_id": "voltrol-5n2",
+        "type": "blocks",
+        "created_at": "2026-07-16T22:40:50Z",
+        "created_by": "Rohit Gudi",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 2,
+    "dependent_count": 0,
+    "comment_count": 0,
+    "parent": "voltrol-upr"
+  },
+  {
+    "id": "voltrol-k9k",
+    "title": "One CoreAudio tap graph per registered (not just audible) app — the architecture's scaling wall",
+    "description": "The unit of discovery, UI identity, and CoreAudio routing is a displayed app, and every such app is materialized as a controller. A controller owns one process tap, one private aggregate device, one IO proc, and an output route. macOS 26 prevents filtering on isRunning, so silence does not remove a registered process from this graph (ProcessMonitor.swift:170-173). At dozens or hundreds of apps, the architecture scales CoreAudio objects, setup/teardown calls, HAL notifications, dictionaries, and potentially RT scheduling linearly with historical registration rather than audible work — not a hot-loop optimization problem, but the system's load-bearing cardinality choice. Helper-process churn temporarily makes the factor worse: performRestart (AudioTapManager.swift:97-120) deliberately starts a replacement graph before stopping the outgoing one.\n\nEvidence: ProcessMonitor.swift:170-173 (isRunning unreliability forces full inclusion), AudioTapManager.swift:11,28-29,51-80,354-407,432-445,471-477 (one controller per app, full CoreAudio object quadruple per controller), docs/load-testing-plan.md:13-18,125-140 (measured scale is 5 apps, not dozens/hundreds).\n\nConvergent-pass proposed direction (a DESIGN QUESTION, not a committed fix): split \"known app\" (lightweight registry entry: volume/mute/persistence state) from \"materialized tap\" (full CoreAudio quadruple). Only create the tap when the app actually needs one — (a) user state is non-identity (volume != 1.0 or isMuted), since the tap is what enforces gain, so it must live; or (b) the popover is open, since metering needs the capture side. On popover close, tear down every identity-gain tap (.mutedWhenTapped restoring the original stream exactly, so it's inaudible). This changes steady-state CoreAudio object count from O(historically registered apps) to O(apps the user has actually adjusted) — arguably what the isRunning loss actually broke.\n\nTradeoff: popover-open becomes a tap-creation burst (needs staggering to avoid a coreaudiod stampede); first slider touch on a cold app pays tap-setup latency plus a small audible gain-engage step; two-tier lifecycle is real complexity layered on an already-implicit one (see voltrol-w2o, the tap-lifecycle state-machine plan — that should land FIRST if this is pursued, since demand-driven materialization needs an explicit state machine to be safe).\n\nXL effort, HIGH risk. This is a genuine architecture decision, not a drop-in fix. Filed as a bead with the finding and proposed direction only — no implementation plan. If pursued, should be scoped as a design/spike investigation first, not a build-everything plan.\n\n## Steps to Reproduce\n\n1. Have dozens/hundreds of apps register with CoreAudio over a long uptime (achievable given macOS 26's isRunning unreliability forcing full historical retention, not just currently-audible apps).\n2. Observe Voltrol materializes a full process tap + aggregate device + IO proc for every one of them, regardless of whether the app has ever produced audible sound or had its volume touched.\n3. CoreAudio object count, coreaudiod notification traffic, and potential RT scheduling load scale with historical registration count, not audible-work count.\n",
+    "design": "Proposed direction (not committed): split registry (lightweight, always exists) from materialized tap (created only for non-identity-volume apps or while popover is open). Should sequence AFTER voltrol-w2o (tap lifecycle state machine) if pursued, since demand-driven materialization needs an explicit state machine to be safe. Effort: XL.",
+    "acceptance_criteria": "No plan yet — this needs a design/spike investigation before any build plan, given XL effort and HIGH risk.",
+    "notes": "Phase 3 (production enable, outcome B) in PR #33. Judge PASS 0.85 CONDITIONAL on manual hardware smoke test (flag-flip line has no automated coverage by design). Suite 318/0/33. Also closes voltrol-7wv. NOT merged — needs user smoke test.",
+    "status": "in_progress",
+    "priority": 3,
+    "issue_type": "bug",
+    "assignee": "Rohit Gudi",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-07-14T01:36:21Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-07-17T16:09:29Z",
+    "started_at": "2026-07-15T20:55:16Z",
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "voltrol-7yd",
+    "title": "Popover-open panel is O(N) in tapped-app count (views/timers/layout) — needs UX sign-off before fixing",
+    "description": "Opening the popover materializes an O(N) fleet of views, timers, and layout work, one per tapped app. Evidence: ContentView.swift:76-82 eagerly creates an AppVolumeRow for every filtered app inside a plain VStack (no ScrollView — the panel deliberately grows with content, per PROJECT_CONTEXT.md:164-165). Each row (AppVolumeRow.swift:65-68) owns its own WaveformView + provider. Each active waveform subscribes to a shared 20Hz clock, but every tick copies the subscriber dictionary and invokes every model (WaveformView.swift:72-84); each active waveform also owns a 30fps TimelineView (WaveformView.swift:224-227). The master waveform additionally scans every app for its provider (AudioState.swift:121-127, MasterVolumeView.swift:67-68). With dozens/hundreds of tapped apps, opening the popover activates a burst of view construction, layout, timers, model ticks, canvas rendering, and atomic level reads on the main thread.\n\nConvergent-pass proposed fix: replace the VStack with ScrollView+LazyVStack capped at ~10-12 rows of height; WaveformView already subscribes/unsubscribes in onAppear/onDisappear, so lazy row realization automatically bounds clock subscribers and per-row work to O(visible) regardless of app count. Complement with a running-max combinedLevel maintained by AudioTapManager so the master waveform stops scanning all apps 20x/sec.\n\nTHIS FIX DELIBERATELY REVERSES A DOCUMENTED DESIGN DECISION (PROJECT_CONTEXT.md:164-165 — \"no ScrollView, panel grows with content\"). That is a UX call, not an engineering one, and needs Rohit's sign-off before any plan is written or code touched. Filed as a bead with the finding only; no implementation plan exists.\n\n## Steps to Reproduce\n\n1. Tap dozens or hundreds of apps (achievable given Voltrol's macOS-26-forced inclusion of every registered process, not just audible ones).\n2. Open the menu-bar popover.\n3. Observe main-thread cost scaling with total tapped-app count: view construction, 30fps TimelineViews per row, 20Hz clock tick fanning out to every subscriber, and a full-app scan for the master waveform level — all without a documented perf budget for high app counts (docs/load-testing-plan.md measures only a 5-app scenario).\n",
+    "design": "Proposed (not yet approved): ScrollView+LazyVStack capped at ~10-12 rows; running-max combinedLevel on AudioTapManager to stop the master waveform's per-tick full-app scan. Effort: M.",
+    "acceptance_criteria": "No plan yet. Needs Rohit's decision on whether to reverse the documented no-ScrollView design before any plan is written.",
+    "notes": "Risk: LOW-MED (mostly the UX-decision risk of reversing a documented choice). Effort: M. Found via /uplift brainstorm (droid gpt-5.6-sol divergent + Fable convergent), 2f395ac. NOT planned — awaiting UX sign-off.",
+    "status": "open",
+    "priority": 3,
+    "issue_type": "bug",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-07-14T01:36:03Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-07-14T01:36:03Z",
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "voltrol-4jm",
+    "title": "Icon flash animation is intentional — do NOT change to alpha-fade",
+    "description": "The menu-bar bolt flash MUST remain the 'fill-up' effect: bolt (outline) ↔ bolt.fill (solid) image swap on the 0.9s flashTimer in AppDelegate.makeIcon(lit:). Commit 6a13524 replaced this with a single bolt.fill toggling alphaValue (a fade, not a fill) for a marginal AutoLayout saving; the user reverted it and confirmed the animation must not change. The setImage: AutoLayout cost on a 0.9s (~1Hz) timer is negligible. This is a standing design constraint, not a bug.",
+    "status": "open",
+    "priority": 3,
+    "issue_type": "task",
+    "owner": "50377477+caretak3r@users.noreply.github.com",
+    "created_at": "2026-07-02T18:59:51Z",
+    "created_by": "Rohit Gudi",
+    "updated_at": "2026-07-02T18:59:51Z",
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  }
+]
