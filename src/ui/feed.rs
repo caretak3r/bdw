@@ -35,14 +35,19 @@ fn actor_color(actor: &Actor) -> Color {
     ACTOR_COLORS[(hasher.finish() % ACTOR_COLORS.len() as u64) as usize]
 }
 
-/// Compact display label for an actor: cuts at the first `+` or `@` (covers
-/// GitHub noreply addresses like `50377477+caretak3r@users.noreply.github.com`
-/// → `50377477`), else hard-truncates at a char boundary so the board/feed
-/// panes stay narrow. Detail views should show `actor.0` in full instead.
+/// Compact display label for an actor: the email local part, preferring what
+/// follows a `+` (GitHub noreply addresses like
+/// `50377477+caretak3r@users.noreply.github.com` → `caretak3r`, not the
+/// meaningless numeric id), else hard-truncates at a char boundary so the
+/// board/feed panes stay narrow. Detail views should show `actor.0` in full.
 pub(crate) fn short_name(actor: &Actor) -> &str {
     let raw = actor.0.as_str();
-    if let Some(idx) = raw.find(['+', '@']) {
-        return &raw[..idx];
+    if let Some(at) = raw.find('@') {
+        let local = &raw[..at];
+        return match local.find('+') {
+            Some(plus) if plus + 1 < local.len() => &local[plus + 1..],
+            _ => local,
+        };
     }
     const MAX: usize = 24;
     match raw.char_indices().nth(MAX) {
@@ -233,6 +238,18 @@ mod tests {
     fn actor_color_is_stable_across_calls() {
         let a = Actor("sonnet-impl-2".to_string());
         assert_eq!(actor_color(&a), actor_color(&a));
+    }
+
+    #[test]
+    fn short_name_prefers_username_over_noreply_id() {
+        let gh = Actor("50377477+caretak3r@users.noreply.github.com".to_string());
+        assert_eq!(short_name(&gh), "caretak3r");
+        let plain = Actor("gudi.k.rohit@gmail.com".to_string());
+        assert_eq!(short_name(&plain), "gudi.k.rohit");
+        let bare = Actor("fable-orchestrator".to_string());
+        assert_eq!(short_name(&bare), "fable-orchestrator");
+        let long = Actor("x".repeat(40));
+        assert_eq!(short_name(&long).chars().count(), 24);
     }
 
     #[test]
