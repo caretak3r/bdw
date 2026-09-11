@@ -1,6 +1,7 @@
 mod app;
 mod model;
 mod source;
+mod theme;
 mod ui;
 
 use std::collections::HashMap;
@@ -10,11 +11,12 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use crossterm::event::{Event, KeyEventKind};
+use crossterm::event::{Event, KeyEventKind, MouseButton, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 
-use app::{App, RefreshOutcome};
+use app::{Action, App, Mode, RefreshOutcome};
 use source::bd::BdClient;
 use source::events::{audit_to_feed_event, diff_snapshots, Tailer};
 
@@ -127,7 +129,7 @@ async fn run_tui(root: PathBuf) -> Result<()> {
         .unwrap_or_else(|| root.display().to_string());
 
     let mut terminal = setup_terminal()?;
-    let app = App::new(root.clone(), project_name);
+    let app = App::new(root.clone(), project_name).with_theme(theme::load_theme_kind());
     let result = app_loop(&mut terminal, app, root).await;
     restore_terminal(&mut terminal)?;
     result
@@ -136,8 +138,12 @@ async fn run_tui(root: PathBuf) -> Result<()> {
 fn setup_terminal() -> Result<Term> {
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)
-        .context("entering alternate screen")?;
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )
+    .context("entering alternate screen")?;
     install_panic_hook();
     Terminal::new(CrosstermBackend::new(stdout)).context("creating terminal")
 }
@@ -148,6 +154,7 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
     crossterm::terminal::disable_raw_mode().context("disabling raw mode")?;
     crossterm::execute!(
         terminal.backend_mut(),
+        crossterm::event::DisableMouseCapture,
         crossterm::terminal::LeaveAlternateScreen
     )
     .context("leaving alternate screen")?;
@@ -158,7 +165,11 @@ fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::terminal::LeaveAlternateScreen
+        );
         default_hook(info);
     }));
 }
@@ -181,10 +192,16 @@ async fn app_loop(terminal: &mut Term, mut app: App, root: PathBuf) -> Result<()
     loop {
         tokio::select! {
             Some(event) = input_rx.recv() => {
-                if let Event::Key(key) = event {
-                    if key.kind == KeyEventKind::Press {
+                match event {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        let prev_theme = app.theme_kind;
                         app.handle_key(key.code);
+                        if app.theme_kind != prev_theme {
+                            theme::save_theme_kind(app.theme_kind);
+                        }
                     }
+                    Event::Mouse(mouse) => handle_mouse(terminal, &mut app, mouse)?,
+                    _ => {}
                 }
             }
             Some(outcome) = refresh_rx.recv() => {
@@ -197,6 +214,62 @@ async fn app_loop(terminal: &mut Term, mut app: App, root: PathBuf) -> Result<()
         if app.should_quit {
             break;
         }
+    }
+    Ok(())
+}
+
+/// Left-button down near the tasks/events splitter starts a drag; drag
+/// events while held resize the split ratio; button-up ends it. Recomputes
+/// layout from the current terminal size each time rather than caching a
+/// rect on `App`, so a mid-drag resize of the terminal itself can't leave
+/// hit-testing stale.
+fn handle_mouse(
+    terminal: &mut Term,
+    app: &mut App,
+    mouse: crossterm::event::MouseEvent,
+) -> Result<()> {
+    let size = terminal.size().context("reading terminal size")?;
+    let full = Rect::new(0, 0, size.width, size.height);
+    let regions = ui::compute_regions(ui::main_area(full, app), app);
+
+    const WHEEL_STEP: i32 = 3;
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if ui::near_splitter(&regions, app, mouse.column, mouse.row) {
+                app.begin_drag();
+            } else if app.mode == Mode::Normal
+                && ui::region_contains(regions.board, mouse.column, mouse.row)
+            {
+                if let Some(ordinal) = ui::board::ordinal_at_row(app, regions.board, mouse.row) {
+                    app.selected = ordinal;
+                }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if app.dragging_split {
+                app.set_split_ratio(ui::ratio_from_pos(&regions, app, mouse.column, mouse.row));
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => app.end_drag(),
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let dir = if mouse.kind == MouseEventKind::ScrollUp {
+                -1
+            } else {
+                1
+            };
+            if app.mode == Mode::Detail {
+                app.scroll_detail(dir * WHEEL_STEP);
+            } else if ui::region_contains(regions.feed, mouse.column, mouse.row) {
+                app.scroll_feed(dir * WHEEL_STEP);
+            } else if ui::region_contains(regions.board, mouse.column, mouse.row) {
+                let action = if dir < 0 { Action::Up } else { Action::Down };
+                for _ in 0..WHEEL_STEP {
+                    app.apply_action(action);
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
 }

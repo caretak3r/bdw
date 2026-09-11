@@ -10,8 +10,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::App;
+use crate::theme::Theme;
 
-use super::colors;
 use super::feed::{change_label, status_label};
 
 /// Most-recent events shown in the history panel; the ring itself can be
@@ -25,49 +25,78 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &App) {
 
     let popup = centered_rect(80, 80, area);
     f.render_widget(Clear, popup);
+    // -2 for the block's left/right borders; markdown code-block/table rules
+    // are sized to this so they don't overrun the popup.
+    let content_width = popup.width.saturating_sub(2) as usize;
 
-    let block = Block::default()
+    let theme = &app.theme;
+    let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(colors::BORDER))
+        .border_style(Style::default().fg(theme.border))
         .title(format!(" {} ", issue.id))
         .title_top(
-            Line::from(Span::styled(
-                "esc close",
-                Style::default().fg(colors::DIMMER),
-            ))
-            .right_aligned(),
+            Line::from(Span::styled("esc close", Style::default().fg(theme.dimmer)))
+                .right_aligned(),
         );
+    if let Some(bg) = theme.bg {
+        block = block.style(Style::default().bg(bg));
+    }
 
     let mut lines = vec![
         Line::from(Span::styled(
             issue.title.clone(),
-            Style::default().fg(colors::FG).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
-        kv_line("status", status_label(&issue.status).to_string()),
-        kv_line("priority", fmt_prio(issue.priority)),
-        kv_line("type", fmt_opt_str(&non_empty(&issue.issue_type))),
-        kv_line("parent", fmt_opt_str(&issue.parent)),
-        kv_line("owner", fmt_opt_str(&issue.owner)),
-        kv_line("created by", fmt_opt_str(&issue.created_by)),
+        kv_line("status", status_label(&issue.status).to_string(), theme),
+        kv_line("priority", fmt_prio(issue.priority), theme),
+        kv_line("type", fmt_opt_str(&non_empty(&issue.issue_type)), theme),
+        kv_line("parent", fmt_opt_str(&issue.parent), theme),
+        kv_line("owner", fmt_opt_str(&issue.owner), theme),
+        kv_line("created by", fmt_opt_str(&issue.created_by), theme),
         kv_line(
             "deps",
             format!(
                 "depends on {} · blocks {}",
                 issue.dependency_count, issue.dependent_count
             ),
+            theme,
         ),
     ];
 
-    push_section(&mut lines, "DESCRIPTION", non_empty(&issue.description));
-    push_section(&mut lines, "NOTES", issue.notes.clone());
-    push_section(&mut lines, "DESIGN", issue.design.clone());
-    push_section(&mut lines, "ACCEPTANCE", issue.acceptance_criteria.clone());
+    push_section(
+        &mut lines,
+        "DESCRIPTION",
+        non_empty(&issue.description),
+        theme,
+        content_width,
+    );
+    push_section(
+        &mut lines,
+        "NOTES",
+        issue.notes.clone(),
+        theme,
+        content_width,
+    );
+    push_section(
+        &mut lines,
+        "DESIGN",
+        issue.design.clone(),
+        theme,
+        content_width,
+    );
+    push_section(
+        &mut lines,
+        "ACCEPTANCE",
+        issue.acceptance_criteria.clone(),
+        theme,
+        content_width,
+    );
 
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "HISTORY",
-        Style::default().fg(colors::DIMMER),
+        Style::default().fg(theme.dimmer),
     )));
     let history: Vec<_> = app
         .feed
@@ -78,7 +107,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &App) {
     if history.is_empty() {
         lines.push(Line::from(Span::styled(
             "  no events this session",
-            Style::default().fg(colors::DIM),
+            Style::default().fg(theme.dim),
         )));
     }
     for event in history {
@@ -90,21 +119,30 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &App) {
             .map(|a| a.0.clone())
             .unwrap_or_else(|| "derived".to_string());
         lines.push(Line::from(vec![
-            Span::styled(format!("  {actor}  "), Style::default().fg(colors::DIM)),
+            Span::styled(format!("  {actor}  "), Style::default().fg(theme.dim)),
             Span::raw(change_label(&event.change)),
         ]));
     }
 
+    // Approximate: wrapping can reflow `lines` into more visual rows than
+    // this, so the clamp is a slight overestimate of how far there is to
+    // scroll — harmless, worst case is a screen of trailing blank space.
+    let inner_h = popup.height.saturating_sub(2);
+    let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
+    let scroll = app.detail_scroll.min(max_scroll);
     f.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: true })
+            .scroll((scroll, 0)),
         popup,
     );
 }
 
-fn kv_line(key: &str, value: String) -> Line<'static> {
+fn kv_line(key: &str, value: String, theme: &Theme) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{key:>10}  "), Style::default().fg(colors::DIM)),
-        Span::styled(value, Style::default().fg(colors::FG)),
+        Span::styled(format!("{key:>10}  "), Style::default().fg(theme.dim)),
+        Span::styled(value, Style::default().fg(theme.fg)),
     ])
 }
 
@@ -121,16 +159,22 @@ fn fmt_prio(p: Option<i32>) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-fn push_section(lines: &mut Vec<Line<'static>>, label: &'static str, body: Option<String>) {
+fn push_section(
+    lines: &mut Vec<Line<'static>>,
+    label: &'static str,
+    body: Option<String>,
+    theme: &Theme,
+    content_width: usize,
+) {
     let Some(body) = body.filter(|b| !b.is_empty()) else {
         return;
     };
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         label,
-        Style::default().fg(colors::DIMMER),
+        Style::default().fg(theme.dimmer),
     )));
-    lines.push(Line::raw(body));
+    lines.extend(super::markdown::render(&body, theme, content_width));
 }
 
 fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {

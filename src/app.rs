@@ -9,9 +9,21 @@ use chrono::{DateTime, Utc};
 use crossterm::event::KeyCode;
 
 use crate::model::{Actor, Counts, FeedEvent, Issue, Status};
+use crate::theme::{Theme, ThemeKind};
 
 /// Cap on the merged feed ring; oldest events fall off the back.
 pub(crate) const FEED_CAP: usize = 500;
+
+/// How long a row/actor-dot gloss flash takes to fade back to resting color.
+pub(crate) const PULSE_MS: i64 = 2500;
+
+/// Fade window for the banner's freshness highlight, and the grace period a
+/// no-longer-`in_progress` issue (e.g. just closed) stays visible in the
+/// ACTIVE banner after its last touch before it's dropped entirely.
+pub(crate) const BANNER_MS: i64 = 6000;
+
+/// Max number of issues shown at once in the ACTIVE banner.
+pub(crate) const BANNER_CAP: usize = 6;
 
 /// Everything one refresh cycle produces: a fresh bd snapshot, its counts,
 /// and this cycle's audit + derived feed events (already newest-first).
@@ -35,10 +47,31 @@ pub(crate) enum Action {
     GroupStatus,
     EnterSearch,
     CycleActor,
+    ToggleOrientation,
+    CycleTheme,
     /// `esc` in normal mode: closes an overlay-less clear, in priority order
     /// actor filter then leftover search text. Overlay/search-mode `esc` is
     /// handled directly by `App::handle_key`, not through this action.
     ClearFilters,
+}
+
+/// Fraction of a `window_ms` fade window still remaining, linearly, or
+/// `0.0` if `at` is `None`, in the future, or older than the window.
+fn pulse_fraction_over(at: Option<&DateTime<Utc>>, window_ms: i64) -> f32 {
+    let Some(at) = at else {
+        return 0.0;
+    };
+    let elapsed = (Utc::now() - *at).num_milliseconds();
+    if !(0..window_ms).contains(&elapsed) {
+        return 0.0;
+    }
+    1.0 - (elapsed as f32 / window_ms as f32)
+}
+
+/// Fraction of a pulse's `PULSE_MS` window still remaining — see
+/// `pulse_fraction_over`.
+fn pulse_fraction(at: Option<&DateTime<Utc>>) -> f32 {
+    pulse_fraction_over(at, PULSE_MS)
 }
 
 /// Pure key→action mapping for normal mode, kept separate from `App` so it
@@ -57,9 +90,26 @@ pub(crate) fn key_to_action(code: KeyCode) -> Option<Action> {
         KeyCode::Char('s') => Some(Action::GroupStatus),
         KeyCode::Char('/') => Some(Action::EnterSearch),
         KeyCode::Char('a') => Some(Action::CycleActor),
+        KeyCode::Char('v') => Some(Action::ToggleOrientation),
+        KeyCode::Char('t') => Some(Action::CycleTheme),
         _ => None,
     }
 }
+
+/// Which axis the tasks/events panes split along. Toggled by `v`; the
+/// splitter ratio between them is shared across both orientations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Orientation {
+    /// Tasks left, events right (default — matches the original mock).
+    Horizontal,
+    /// Tasks on top, events below — for reading long event/description text.
+    Vertical,
+}
+
+/// Splitter ratio bounds, as a percentage given to the tasks pane. Clamped so
+/// a runaway drag can never collapse either pane to nothing.
+pub(crate) const MIN_SPLIT: u16 = 20;
+pub(crate) const MAX_SPLIT: u16 = 80;
 
 /// How the tasks pane groups issues. Toggled by `e`/`s`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +142,15 @@ pub(crate) struct App {
     pub(crate) counts: Counts,
     pub(crate) feed: VecDeque<FeedEvent>,
     pub(crate) actors: HashMap<Actor, DateTime<Utc>>,
+    /// Last time each issue id was observed to change, for the board row's
+    /// gloss-flash fade. Populated from refresh #2 onward — see `seeded`.
+    pub(crate) issue_pulses: HashMap<String, DateTime<Utc>>,
+    /// Last time each actor posted an event, for the actor-strip dot pulse.
+    pub(crate) actor_pulses: HashMap<Actor, DateTime<Utc>>,
+    /// The first `apply_refresh` diffs against an empty snapshot, so every
+    /// issue looks "created" — that's the initial load, not a live change,
+    /// so pulses are only recorded from the second refresh onward.
+    seeded: bool,
     pub(crate) selected: usize,
     pub(crate) last_update: Option<DateTime<Utc>>,
     pub(crate) malformed: usize,
@@ -100,6 +159,19 @@ pub(crate) struct App {
     pub(crate) group_by: GroupBy,
     pub(crate) search: String,
     pub(crate) actor_filter: Option<Actor>,
+    pub(crate) orientation: Orientation,
+    /// Percentage of the split axis given to the tasks pane; `MIN_SPLIT..=MAX_SPLIT`.
+    pub(crate) split_ratio: u16,
+    /// Set while a left-button drag started on the splitter is still held.
+    pub(crate) dragging_split: bool,
+    pub(crate) theme_kind: ThemeKind,
+    pub(crate) theme: Theme,
+    /// Lines scrolled down in the LIVE EVENTS pane, via mouse wheel.
+    pub(crate) feed_scroll: u16,
+    /// Lines scrolled down in the detail popup, via mouse wheel. Reset to 0
+    /// every time the popup opens, so it never opens mid-scroll on a
+    /// different issue's old position.
+    pub(crate) detail_scroll: u16,
 }
 
 impl App {
@@ -112,6 +184,9 @@ impl App {
             counts: Counts::default(),
             feed: VecDeque::new(),
             actors: HashMap::new(),
+            issue_pulses: HashMap::new(),
+            actor_pulses: HashMap::new(),
+            seeded: false,
             selected: 0,
             last_update: None,
             malformed: 0,
@@ -120,7 +195,22 @@ impl App {
             group_by: GroupBy::Status,
             search: String::new(),
             actor_filter: None,
+            orientation: Orientation::Horizontal,
+            split_ratio: 46,
+            dragging_split: false,
+            theme_kind: ThemeKind::Nord,
+            theme: ThemeKind::Nord.theme(),
+            feed_scroll: 0,
+            detail_scroll: 0,
         }
+    }
+
+    /// Builder-style so the ~10 existing `App::new` test call sites don't
+    /// need a third argument just to pick the default theme.
+    pub(crate) fn with_theme(mut self, kind: ThemeKind) -> Self {
+        self.theme_kind = kind;
+        self.theme = kind.theme();
+        self
     }
 
     /// Rebuilds board state wholesale from a fresh bd snapshot and merges
@@ -144,6 +234,17 @@ impl App {
                 }
             }
         }
+        if self.seeded {
+            let now = Utc::now();
+            for event in &outcome.events {
+                self.issue_pulses.insert(event.issue_id.clone(), now);
+                if let Some(actor) = &event.actor {
+                    self.actor_pulses.insert(actor.clone(), now);
+                }
+            }
+        }
+        self.seeded = true;
+
         // `outcome.events` is newest-first; pushing front in reverse (oldest
         // of the batch first) keeps the whole ring newest-first afterwards.
         for event in outcome.events.into_iter().rev() {
@@ -181,6 +282,64 @@ impl App {
         })
     }
 
+    /// `1.0` the instant an issue changes, fading linearly to `0.0` over
+    /// `PULSE_MS`; `0.0` once decayed or never touched this session.
+    pub(crate) fn issue_pulse(&self, issue_id: &str) -> f32 {
+        pulse_fraction(self.issue_pulses.get(issue_id))
+    }
+
+    /// Same fade, keyed by actor — drives the actor-strip dot pulse.
+    pub(crate) fn actor_pulse(&self, actor: &Actor) -> f32 {
+        pulse_fraction(self.actor_pulses.get(actor))
+    }
+
+    /// Fraction of the "recently touched" banner's `BANNER_MS` window still
+    /// remaining for `issue_id` — drives the banner row's fade-out.
+    pub(crate) fn banner_pulse(&self, issue_id: &str) -> f32 {
+        pulse_fraction_over(self.issue_pulses.get(issue_id), BANNER_MS)
+    }
+
+    /// The ACTIVE banner's data source: every `in_progress` issue (the work
+    /// genuinely underway right now — this is what makes the banner an
+    /// "airline departures board" rather than a transient toast), plus
+    /// anything else touched within `BANNER_MS` so a status change that
+    /// leaves `in_progress` (e.g. closing) still gets a short visible grace
+    /// period before dropping off. Freshly touched entries sort to the top;
+    /// untouched in-progress entries follow, oldest-updated first, so
+    /// long-running work stays put instead of jumping around every frame.
+    pub(crate) fn active_board(&self) -> Vec<&Issue> {
+        let mut items: Vec<(&Issue, Option<&DateTime<Utc>>)> = self
+            .issues
+            .iter()
+            .filter(|issue| {
+                issue.status == Status::InProgress
+                    || pulse_fraction_over(self.issue_pulses.get(&issue.id), BANNER_MS) > 0.0
+            })
+            .map(|issue| (issue, self.issue_pulses.get(&issue.id)))
+            .collect();
+        items.sort_by(|a, b| match (a.1, b.1) {
+            (Some(a_at), Some(b_at)) => b_at.cmp(a_at),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.0.updated_at.cmp(&b.0.updated_at),
+        });
+        items.truncate(BANNER_CAP);
+        items.into_iter().map(|(issue, _)| issue).collect()
+    }
+
+    /// Moves the LIVE EVENTS scroll position by `delta` lines (negative
+    /// scrolls up), floored at 0. Not clamped to content length here — the
+    /// pane doesn't know its own rendered height until draw time, so
+    /// `feed::draw_events` clamps what it actually applies.
+    pub(crate) fn scroll_feed(&mut self, delta: i32) {
+        self.feed_scroll = (self.feed_scroll as i32 + delta).max(0) as u16;
+    }
+
+    /// Same as `scroll_feed`, for the detail popup.
+    pub(crate) fn scroll_detail(&mut self, delta: i32) {
+        self.detail_scroll = (self.detail_scroll as i32 + delta).max(0) as u16;
+    }
+
     pub(crate) fn apply_action(&mut self, action: Action) {
         match action {
             Action::Quit => self.should_quit = true,
@@ -196,6 +355,7 @@ impl App {
             Action::OpenDetail => {
                 if self.visible_row_count() > 0 {
                     self.mode = Mode::Detail;
+                    self.detail_scroll = 0;
                 }
             }
             Action::GroupEpic => {
@@ -208,6 +368,16 @@ impl App {
             }
             Action::EnterSearch => self.mode = Mode::Search,
             Action::CycleActor => self.cycle_actor_filter(),
+            Action::ToggleOrientation => {
+                self.orientation = match self.orientation {
+                    Orientation::Horizontal => Orientation::Vertical,
+                    Orientation::Vertical => Orientation::Horizontal,
+                };
+            }
+            Action::CycleTheme => {
+                self.theme_kind = self.theme_kind.next();
+                self.theme = self.theme_kind.theme();
+            }
             Action::ClearFilters => {
                 if self.actor_filter.take().is_none() && !self.search.is_empty() {
                     self.search.clear();
@@ -275,6 +445,20 @@ impl App {
         };
     }
 
+    pub(crate) fn begin_drag(&mut self) {
+        self.dragging_split = true;
+    }
+
+    pub(crate) fn end_drag(&mut self) {
+        self.dragging_split = false;
+    }
+
+    /// Sets the splitter ratio, clamped to `MIN_SPLIT..=MAX_SPLIT` so a drag
+    /// past either edge can't collapse a pane to nothing.
+    pub(crate) fn set_split_ratio(&mut self, ratio: u16) {
+        self.split_ratio = ratio.clamp(MIN_SPLIT, MAX_SPLIT);
+    }
+
     pub(crate) fn visible_row_count(&self) -> usize {
         crate::ui::board::row_count(self)
     }
@@ -329,6 +513,48 @@ mod tests {
         assert_eq!(key_to_action(KeyCode::Char('s')), Some(Action::GroupStatus));
         assert_eq!(key_to_action(KeyCode::Char('/')), Some(Action::EnterSearch));
         assert_eq!(key_to_action(KeyCode::Char('a')), Some(Action::CycleActor));
+        assert_eq!(
+            key_to_action(KeyCode::Char('v')),
+            Some(Action::ToggleOrientation)
+        );
+        assert_eq!(key_to_action(KeyCode::Char('t')), Some(Action::CycleTheme));
+    }
+
+    #[test]
+    fn cycle_theme_wraps_through_all_kinds() {
+        let mut app = app_with(Vec::new());
+        let start = app.theme_kind;
+        assert_eq!(start, ThemeKind::Nord);
+        let mut kind = start;
+        loop {
+            app.apply_action(Action::CycleTheme);
+            kind = kind.next();
+            assert_eq!(app.theme_kind, kind);
+            if kind == start {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn toggle_orientation_flips_and_flips_back() {
+        let mut app = app_with(Vec::new());
+        assert_eq!(app.orientation, Orientation::Horizontal);
+        app.apply_action(Action::ToggleOrientation);
+        assert_eq!(app.orientation, Orientation::Vertical);
+        app.apply_action(Action::ToggleOrientation);
+        assert_eq!(app.orientation, Orientation::Horizontal);
+    }
+
+    #[test]
+    fn set_split_ratio_clamps_to_bounds() {
+        let mut app = app_with(Vec::new());
+        app.set_split_ratio(5);
+        assert_eq!(app.split_ratio, MIN_SPLIT);
+        app.set_split_ratio(95);
+        assert_eq!(app.split_ratio, MAX_SPLIT);
+        app.set_split_ratio(50);
+        assert_eq!(app.split_ratio, 50);
     }
 
     #[test]
@@ -446,6 +672,74 @@ mod tests {
         assert_eq!(app.issues[0].status, Status::Closed);
         assert_eq!(app.feed.len(), 3);
         assert_eq!(app.feed[0].timestamp, t0 + chrono::Duration::seconds(3));
+    }
+
+    #[test]
+    fn pulses_are_recorded_from_the_second_refresh_onward() {
+        let mut app = App::new(PathBuf::from("/tmp"), "proj".into());
+        let t0 = Utc::now();
+        // First refresh diffs against an empty snapshot, so every issue looks
+        // "created" — that's initial load, not a live change, so it must not
+        // pulse.
+        app.apply_refresh(RefreshOutcome {
+            issues: vec![issue("a-1", "open")],
+            counts: Counts::default(),
+            events: vec![feed_event("a-1", Some("alice"), t0)],
+            malformed: 0,
+            at: t0,
+        });
+        assert_eq!(app.issue_pulse("a-1"), 0.0);
+        assert_eq!(app.actor_pulse(&Actor("alice".into())), 0.0);
+
+        // A later refresh with a real event is a live change and should pulse.
+        app.apply_refresh(RefreshOutcome {
+            issues: vec![issue("a-1", "closed")],
+            counts: Counts::default(),
+            events: vec![feed_event("a-1", Some("alice"), t0)],
+            malformed: 0,
+            at: t0,
+        });
+        assert!(app.issue_pulse("a-1") > 0.0);
+        assert!(app.actor_pulse(&Actor("alice".into())) > 0.0);
+        assert_eq!(app.issue_pulse("no-such-issue"), 0.0);
+    }
+
+    #[test]
+    fn active_board_includes_in_progress_untouched_and_recently_touched_closed() {
+        let mut app = App::new(PathBuf::from("/tmp"), "proj".into());
+        let t0 = Utc::now();
+        app.apply_refresh(RefreshOutcome {
+            issues: vec![
+                issue("a-1", "in_progress"),
+                issue("a-2", "open"),
+                issue("a-3", "closed"),
+            ],
+            counts: Counts::default(),
+            events: vec![feed_event("a-3", None, t0)],
+            malformed: 0,
+            at: t0,
+        });
+        // Second refresh: a-1 stays in_progress untouched, a-3 just closed
+        // (touched, so it gets a grace period), a-2 is untouched and open —
+        // never in_progress, never touched, so it must not appear.
+        app.apply_refresh(RefreshOutcome {
+            issues: vec![
+                issue("a-1", "in_progress"),
+                issue("a-2", "open"),
+                issue("a-3", "closed"),
+            ],
+            counts: Counts::default(),
+            events: vec![feed_event("a-3", None, t0)],
+            malformed: 0,
+            at: t0,
+        });
+
+        let ids: Vec<&str> = app.active_board().iter().map(|i| i.id.as_str()).collect();
+        assert!(ids.contains(&"a-1"));
+        assert!(ids.contains(&"a-3"));
+        assert!(!ids.contains(&"a-2"));
+        // a-3 was just touched, so it sorts ahead of untouched a-1.
+        assert_eq!(ids[0], "a-3");
     }
 
     #[test]

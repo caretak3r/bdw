@@ -5,64 +5,172 @@
 pub(crate) mod board;
 pub(crate) mod detail;
 pub(crate) mod feed;
+pub(crate) mod markdown;
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Mode};
+use crate::app::{App, Mode, Orientation};
 
-/// Colors lifted from `docs/tui-mock.html`'s CSS variables so the TUI reads
-/// as the same palette in a real terminal.
-pub(crate) mod colors {
-    use ratatui::style::Color;
+/// The three content rects for one frame, plus the `main` area they were
+/// carved from — `main` is what mouse hit-testing measures drag position
+/// against, so it travels with the panes it produced.
+pub(crate) struct Regions {
+    pub(crate) main: Rect,
+    pub(crate) board: Rect,
+    pub(crate) actors: Rect,
+    pub(crate) feed: Rect,
+}
 
-    pub(crate) const FG: Color = Color::Rgb(0xc9, 0xd1, 0xd9);
-    pub(crate) const DIM: Color = Color::Rgb(0x6e, 0x76, 0x81);
-    pub(crate) const DIMMER: Color = Color::Rgb(0x48, 0x4f, 0x58);
-    pub(crate) const BORDER: Color = Color::Rgb(0x30, 0x36, 0x3d);
-    pub(crate) const GREEN: Color = Color::Rgb(0x3f, 0xb9, 0x50);
-    pub(crate) const YELLOW: Color = Color::Rgb(0xd2, 0x99, 0x22);
-    pub(crate) const RED: Color = Color::Rgb(0xf8, 0x51, 0x49);
-    pub(crate) const ORANGE: Color = Color::Rgb(0xdb, 0x6d, 0x28);
-    pub(crate) const CYAN: Color = Color::Rgb(0x39, 0xc5, 0xcf);
-    pub(crate) const BLUE: Color = Color::Rgb(0x58, 0xa6, 0xff);
-    pub(crate) const MAGENTA: Color = Color::Rgb(0xbc, 0x8c, 0xff);
-    pub(crate) const SEL_BG: Color = Color::Rgb(0x1c, 0x2a, 0x3a);
+/// Splits `main` into tasks/actors/events rects for the current orientation
+/// and splitter ratio. Shared by `draw` (rendering) and the mouse handlers in
+/// `main.rs` (hit-testing/dragging), so the two can never disagree about
+/// where the splitter line actually is.
+pub(crate) fn compute_regions(main: Rect, app: &App) -> Regions {
+    let actor_h = actor_strip_height(app);
+    match app.orientation {
+        Orientation::Horizontal => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(app.split_ratio),
+                    Constraint::Percentage(100 - app.split_ratio),
+                ])
+                .split(main);
+            let left = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(actor_h)])
+                .split(cols[0]);
+            Regions {
+                main,
+                board: left[0],
+                actors: left[1],
+                feed: cols[1],
+            }
+        }
+        Orientation::Vertical => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Percentage(app.split_ratio),
+                    Constraint::Length(actor_h),
+                    Constraint::Min(0),
+                ])
+                .split(main);
+            Regions {
+                main,
+                board: rows[0],
+                actors: rows[1],
+                feed: rows[2],
+            }
+        }
+    }
+}
+
+/// Column (Horizontal) or row (Vertical) where the tasks/events boundary
+/// sits — the line a mouse drag grabs to resize.
+fn splitter_coord(regions: &Regions, app: &App) -> u16 {
+    match app.orientation {
+        Orientation::Horizontal => regions.board.x + regions.board.width,
+        Orientation::Vertical => regions.board.y + regions.board.height,
+    }
+}
+
+/// Whether `(col, row)` is within one cell of the splitter line — the
+/// tolerance covers both panes' adjoining border characters.
+pub(crate) fn near_splitter(regions: &Regions, app: &App, col: u16, row: u16) -> bool {
+    let target = splitter_coord(regions, app);
+    let pos = match app.orientation {
+        Orientation::Horizontal => col,
+        Orientation::Vertical => row,
+    };
+    pos.abs_diff(target) <= 1
+}
+
+/// New split ratio for a drag to `(col, row)`, clamped to `MIN_SPLIT..=MAX_SPLIT`.
+pub(crate) fn ratio_from_pos(regions: &Regions, app: &App, col: u16, row: u16) -> u16 {
+    let (pos, origin, span) = match app.orientation {
+        Orientation::Horizontal => (col, regions.main.x, regions.main.width),
+        Orientation::Vertical => {
+            let actor_h = actor_strip_height(app);
+            (
+                row,
+                regions.main.y,
+                regions.main.height.saturating_sub(actor_h),
+            )
+        }
+    };
+    let span = span.max(1);
+    let offset = pos.saturating_sub(origin);
+    let ratio = (offset as u32 * 100 / span as u32) as u16;
+    ratio.clamp(crate::app::MIN_SPLIT, crate::app::MAX_SPLIT)
+}
+
+/// Whether terminal cell `(col, row)` falls inside `rect` — the point-in-rect
+/// check mouse hit-testing needs for wheel/click routing between panes.
+pub(crate) fn region_contains(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+/// Rows the "recently touched" banner needs this frame: 0 when nothing is
+/// currently pulsing (so it takes no space at all), else one bordered row
+/// per touched issue. Shared by `draw` and `main_area` so mouse hit-testing
+/// never disagrees with what was actually rendered.
+fn banner_height(app: &App) -> u16 {
+    let n = app.active_board().len() as u16;
+    if n == 0 {
+        0
+    } else {
+        n + 2
+    }
+}
+
+/// The content area between the 1-row header (plus banner, when present)
+/// and the 1-row footer — shared by `draw` and `main.rs`'s mouse handler so
+/// both agree on where the header/banner and footer end without duplicating
+/// the split.
+pub(crate) fn main_area(full: Rect, app: &App) -> Rect {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(banner_height(app)),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(full)[2]
 }
 
 pub(crate) fn draw(f: &mut Frame, app: &App) {
+    if let Some(bg) = app.theme.bg {
+        f.render_widget(Block::default().style(Style::default().bg(bg)), f.area());
+    }
+
+    let banner_h = banner_height(app);
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(banner_h),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .split(f.area());
 
     draw_header(f, outer[0], app);
+    if banner_h > 0 {
+        draw_banner(f, outer[1], app);
+    }
 
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
-        .split(outer[1]);
+    let regions = compute_regions(outer[2], app);
+    board::draw(f, regions.board, app);
+    feed::draw_actors(f, regions.actors, app);
+    feed::draw_events(f, regions.feed, app);
 
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(actor_strip_height(app)),
-        ])
-        .split(main[0]);
-
-    board::draw(f, left[0], app);
-    feed::draw_actors(f, left[1], app);
-    feed::draw_events(f, main[1], app);
-
-    draw_footer(f, outer[2]);
+    draw_footer(f, outer[3], app);
 
     if app.mode == Mode::Detail {
         detail::draw(f, f.area(), app);
@@ -86,32 +194,34 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let line = Line::from(vec![
         Span::styled(
             app.project_name.clone(),
-            Style::default().fg(colors::FG).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(app.theme.fg)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
             format!("{} issues", counts.total_issues),
-            Style::default().fg(colors::DIM),
+            Style::default().fg(app.theme.dim),
         ),
         Span::raw("  "),
         Span::styled(
             format!("○ {} open", counts.open_issues),
-            Style::default().fg(colors::FG),
+            Style::default().fg(app.theme.fg),
         ),
         Span::raw("  "),
         Span::styled(
             format!("◐ {} wip", counts.in_progress_issues),
-            Style::default().fg(colors::YELLOW),
+            Style::default().fg(app.theme.yellow),
         ),
         Span::raw("  "),
         Span::styled(
             format!("❄ {} blocked", counts.blocked_issues),
-            Style::default().fg(colors::CYAN),
+            Style::default().fg(app.theme.cyan),
         ),
         Span::raw("  "),
         Span::styled(
             format!("✓ {} closed", counts.closed_issues),
-            Style::default().fg(colors::GREEN),
+            Style::default().fg(app.theme.green),
         ),
     ]);
     f.render_widget(Paragraph::new(line), chunks[0]);
@@ -122,26 +232,74 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let (upd_text, upd_style) = match freshness {
         Some(secs) if secs < 3 => (
             format!("updated {secs}s ago"),
-            Style::default().fg(colors::GREEN),
+            Style::default().fg(app.theme.green),
         ),
         Some(secs) => (
             format!("updated {secs}s ago"),
-            Style::default().fg(colors::DIMMER),
+            Style::default().fg(app.theme.dimmer),
         ),
-        None => ("updating…".to_string(), Style::default().fg(colors::DIMMER)),
+        None => (
+            "updating…".to_string(),
+            Style::default().fg(app.theme.dimmer),
+        ),
     };
     let upd =
         Paragraph::new(Line::from(Span::styled(upd_text, upd_style))).alignment(Alignment::Right);
     f.render_widget(upd, chunks[1]);
 }
 
-fn draw_footer(f: &mut Frame, area: Rect) {
+/// ACTIVE board: every `in_progress` issue, persistently listed like an
+/// airline departures board — not just whatever flashed in the last few
+/// seconds. Freshly touched entries glow and float to the top; issues that
+/// have been in progress a while but are quiet just sit there, still
+/// visible. An issue that leaves `in_progress` (e.g. closes) gets one last
+/// `BANNER_MS` grace period, still glowing, before it drops off.
+fn draw_banner(f: &mut Frame, area: Rect, app: &App) {
+    let now = chrono::Utc::now();
+    let lines: Vec<Line> = app
+        .active_board()
+        .into_iter()
+        .map(|issue| {
+            let pulse = app.banner_pulse(&issue.id);
+            let fg = crate::theme::lerp_rgb(app.theme.dim, app.theme.highlight_fg, pulse);
+            let touched_at = app.issue_pulses.get(&issue.id).copied();
+            let change = touched_at
+                .and_then(|_| app.feed.iter().find(|e| e.issue_id == issue.id))
+                .map(|e| feed::change_label(&e.change))
+                .unwrap_or_else(|| feed::status_label(&issue.status).to_string());
+            let age = touched_at
+                .or(issue.updated_at)
+                .map(|at| format!("{}s", (now - at).num_seconds().max(0)))
+                .unwrap_or_else(|| "—".to_string());
+            Line::from(vec![
+                Span::styled(age, Style::default().fg(app.theme.dimmer)),
+                Span::raw("  "),
+                Span::styled(
+                    issue.id.clone(),
+                    Style::default().fg(fg).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(issue.title.clone(), Style::default().fg(fg)),
+                Span::raw("  "),
+                Span::styled(format!("· {change}"), Style::default().fg(app.theme.dim)),
+            ])
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.yellow))
+        .title(" ACTIVE ");
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(46)])
         .split(area);
 
-    let key_style = Style::default().fg(colors::DIM);
+    let key_style = Style::default().fg(app.theme.dim);
     let line = Line::from(vec![
         Span::styled("↑↓/jk", key_style),
         Span::raw(" select  "),
@@ -151,6 +309,10 @@ fn draw_footer(f: &mut Frame, area: Rect) {
         Span::raw(" close/clear  "),
         Span::styled("e/s", key_style),
         Span::raw(" epic/status  "),
+        Span::styled("v", key_style),
+        Span::raw(" orientation  "),
+        Span::styled("t", key_style),
+        Span::raw(" theme  "),
         Span::styled("/", key_style),
         Span::raw(" search  "),
         Span::styled("a", key_style),
@@ -164,7 +326,7 @@ fn draw_footer(f: &mut Frame, area: Rect) {
 
     let ro = Paragraph::new(Line::from(Span::styled(
         "bd --readonly · watch: .beads/ · debounce 250ms",
-        Style::default().fg(colors::DIMMER),
+        Style::default().fg(app.theme.dimmer),
     )))
     .alignment(Alignment::Right);
     f.render_widget(ro, chunks[1]);
@@ -216,5 +378,56 @@ mod tests {
         assert!(rendered.contains("voltrol"));
         assert!(rendered.contains("OPEN"));
         assert!(rendered.contains('○'));
+    }
+
+    #[test]
+    fn horizontal_orientation_places_board_and_feed_side_by_side() {
+        let app = App::new(PathBuf::from("/tmp"), "voltrol".into());
+        let main = Rect::new(0, 0, 100, 40);
+        let regions = compute_regions(main, &app);
+        assert_eq!(regions.board.y, main.y);
+        assert_eq!(regions.feed.y, main.y);
+        assert_eq!(regions.feed.x, regions.board.x + regions.board.width);
+    }
+
+    #[test]
+    fn vertical_orientation_stacks_board_above_feed() {
+        let mut vertical = App::new(PathBuf::from("/tmp"), "voltrol".into());
+        vertical.apply_action(crate::app::Action::ToggleOrientation);
+        let main = Rect::new(0, 0, 100, 40);
+        let regions = compute_regions(main, &vertical);
+        assert_eq!(regions.board.y, main.y);
+        assert_eq!(regions.board.x, main.x);
+        assert!(regions.feed.y > regions.board.y);
+        assert_eq!(
+            regions.board.width, main.width,
+            "vertical panes span full width"
+        );
+        assert_eq!(regions.feed.width, main.width);
+    }
+
+    #[test]
+    fn near_splitter_detects_boundary_within_one_cell() {
+        let app = App::new(PathBuf::from("/tmp"), "voltrol".into());
+        let main = Rect::new(0, 0, 100, 40);
+        let regions = compute_regions(main, &app);
+        let boundary = regions.board.x + regions.board.width;
+        assert!(near_splitter(&regions, &app, boundary, 5));
+        assert!(near_splitter(&regions, &app, boundary - 1, 5));
+        assert!(!near_splitter(&regions, &app, boundary + 5, 5));
+    }
+
+    #[test]
+    fn ratio_from_pos_clamps_to_bounds() {
+        let app = App::new(PathBuf::from("/tmp"), "voltrol".into());
+        let main = Rect::new(0, 0, 100, 40);
+        let regions = compute_regions(main, &app);
+        assert_eq!(ratio_from_pos(&regions, &app, 0, 5), crate::app::MIN_SPLIT);
+        assert_eq!(
+            ratio_from_pos(&regions, &app, 100, 5),
+            crate::app::MAX_SPLIT
+        );
+        let mid = ratio_from_pos(&regions, &app, 50, 5);
+        assert!((45..=55).contains(&mid));
     }
 }

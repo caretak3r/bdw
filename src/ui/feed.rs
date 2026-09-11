@@ -13,26 +13,24 @@ use ratatui::Frame;
 
 use crate::app::App;
 use crate::model::{Actor, Change, FeedEvent, Status};
-
-use super::colors;
-
-const ACTOR_COLORS: [Color; 6] = [
-    colors::CYAN,
-    colors::MAGENTA,
-    colors::BLUE,
-    colors::GREEN,
-    colors::YELLOW,
-    colors::RED,
-];
+use crate::theme::Theme;
 
 /// Stable actor→color hash: `DefaultHasher::new()` uses fixed keys (not
 /// randomized per-process), so the same actor name always lands on the same
 /// color, run to run. Always hashes the full raw actor string, even where
 /// the display label is shortened, so identity stays stable.
-fn actor_color(actor: &Actor) -> Color {
+fn actor_color(actor: &Actor, theme: &Theme) -> Color {
+    let palette = [
+        theme.cyan,
+        theme.magenta,
+        theme.blue,
+        theme.green,
+        theme.yellow,
+        theme.red,
+    ];
     let mut hasher = DefaultHasher::new();
     actor.0.hash(&mut hasher);
-    ACTOR_COLORS[(hasher.finish() % ACTOR_COLORS.len() as u64) as usize]
+    palette[(hasher.finish() % palette.len() as u64) as usize]
 }
 
 /// Compact display label for an actor: the email local part, preferring what
@@ -80,15 +78,21 @@ pub(crate) fn draw_actors(f: &mut Frame, area: Rect, app: &App) {
         let age = (now - *last_seen).num_seconds();
         let live = age < 120;
         let selected = app.actor_filter.as_ref() == Some(actor);
-        let dot_color = if live {
-            actor_color(actor)
+        let base_dot_color = if live {
+            actor_color(actor, &app.theme)
         } else {
-            colors::DIM
+            app.theme.dim
+        };
+        let pulse = app.actor_pulse(actor);
+        let dot_color = if pulse > 0.0 {
+            crate::theme::lerp_rgb(base_dot_color, app.theme.highlight_fg, pulse)
+        } else {
+            base_dot_color
         };
         let mut name_style = if live {
-            Style::default().fg(colors::FG)
+            Style::default().fg(app.theme.fg)
         } else {
-            Style::default().fg(colors::DIM)
+            Style::default().fg(app.theme.dim)
         };
         if selected {
             name_style = name_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
@@ -102,18 +106,18 @@ pub(crate) fn draw_actors(f: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             fmt_age(age),
-            Style::default().fg(colors::DIMMER),
+            Style::default().fg(app.theme.dimmer),
         ));
     }
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(colors::BORDER))
+        .border_style(Style::default().fg(app.theme.border))
         .title(" ACTORS ")
         .title_top(
             Line::from(Span::styled(
                 "[a]ctor filter",
-                Style::default().fg(colors::DIMMER),
+                Style::default().fg(app.theme.dimmer),
             ))
             .right_aligned(),
         );
@@ -158,7 +162,7 @@ pub(crate) fn change_label(change: &Change) -> String {
     }
 }
 
-fn event_lines(event: &FeedEvent, now: DateTime<Utc>) -> Vec<Line<'static>> {
+fn event_lines(event: &FeedEvent, now: DateTime<Utc>, theme: &Theme) -> Vec<Line<'static>> {
     let age = (now - event.timestamp).num_seconds();
     let actor_name = event
         .actor
@@ -166,24 +170,24 @@ fn event_lines(event: &FeedEvent, now: DateTime<Utc>) -> Vec<Line<'static>> {
         .map(|a| short_name(a).to_string())
         .unwrap_or_else(|| "derived".to_string());
     let actor_style = match &event.actor {
-        Some(actor) => Style::default().fg(actor_color(actor)),
-        None => Style::default().fg(colors::DIMMER),
+        Some(actor) => Style::default().fg(actor_color(actor, theme)),
+        None => Style::default().fg(theme.dimmer),
     };
 
     let head = Line::from(vec![
-        Span::styled(fmt_age(age), Style::default().fg(colors::DIMMER)),
+        Span::styled(fmt_age(age), Style::default().fg(theme.dimmer)),
         Span::raw("  "),
         Span::styled(actor_name, actor_style),
         Span::raw("  "),
-        Span::styled(event.issue_id.clone(), Style::default().fg(colors::DIM)),
+        Span::styled(event.issue_id.clone(), Style::default().fg(theme.dim)),
     ]);
 
     let change_style = if event.derived {
         Style::default()
-            .fg(colors::DIMMER)
+            .fg(theme.dimmer)
             .add_modifier(Modifier::ITALIC)
     } else {
-        Style::default().fg(colors::FG)
+        Style::default().fg(theme.fg)
     };
     let mut change_text = change_label(&event.change);
     if event.derived {
@@ -198,7 +202,7 @@ fn event_lines(event: &FeedEvent, now: DateTime<Utc>) -> Vec<Line<'static>> {
         lines.push(Line::from(Span::styled(
             format!("  \u{201c}{reason}\u{201d}"),
             Style::default()
-                .fg(colors::DIM)
+                .fg(theme.dim)
                 .add_modifier(Modifier::ITALIC),
         )));
     }
@@ -209,7 +213,7 @@ pub(crate) fn draw_events(f: &mut Frame, area: Rect, app: &App) {
     let now = Utc::now();
     let mut lines = Vec::new();
     for event in app.feed.iter().filter(|e| matches_actor_filter(e, app)) {
-        lines.extend(event_lines(event, now));
+        lines.extend(event_lines(event, now, &app.theme));
     }
 
     let title = match &app.actor_filter {
@@ -218,9 +222,12 @@ pub(crate) fn draw_events(f: &mut Frame, area: Rect, app: &App) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(colors::BORDER))
+        .border_style(Style::default().fg(app.theme.border))
         .title(title);
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    let inner_h = area.height.saturating_sub(2);
+    let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
+    let scroll = app.feed_scroll.min(max_scroll);
+    f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
 }
 
 fn matches_actor_filter(event: &FeedEvent, app: &App) -> bool {
@@ -237,7 +244,8 @@ mod tests {
     #[test]
     fn actor_color_is_stable_across_calls() {
         let a = Actor("sonnet-impl-2".to_string());
-        assert_eq!(actor_color(&a), actor_color(&a));
+        let theme = Theme::nord();
+        assert_eq!(actor_color(&a, &theme), actor_color(&a, &theme));
     }
 
     #[test]
