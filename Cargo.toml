@@ -1,6 +1,6 @@
 [package]
 name = "bdw"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Real-time terminal dashboard for beads (bd) task-tracking projects"
 license = "MIT"
