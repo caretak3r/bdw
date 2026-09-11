@@ -29,6 +29,10 @@ Full interaction (grouping toggle, detail overlay, live events feed):
 
 ![bdw demo](docs/screenshots/board.gif)
 
+Orientation toggle (`v`) and drag-to-resize pane splits:
+
+![Orientation toggle and drag resize](docs/screenshots/orientation-drag.gif)
+
 ### Themes
 
 `t` cycles through nine terminal-familiar palettes, persisted to `~/.config/bdw/theme`:
