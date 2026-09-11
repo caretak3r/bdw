@@ -1,0 +1,6 @@
+[workspace]
+# bdw is distributed via GitHub Releases only, never published to crates.io.
+# git_only makes release-plz derive the current version from git tags instead
+# of querying the cargo registry (which would never find this package).
+git_only = true
+publish = false
