@@ -1,8 +1,15 @@
 [workspace]
 # bdw is distributed via GitHub Releases only, never published to crates.io.
-# git_only makes release-plz derive the current version from git tags instead
-# of querying the cargo registry (which would never find this package).
+#
+# git_only: derive the current/next version from git tags instead of the
+# cargo registry (which would never have this package).
+#
+# publish: skip `cargo publish`. NOTE this is release-plz's own gate, NOT
+# Cargo.toml's `publish` field. Cargo.toml MUST NOT set `publish = false` —
+# release-plz treats that as "not publishable at all" and silently skips
+# git tags/releases too, even with git_only set.
 git_only = true
 publish = false
+
 # Binary-only crate (no [lib] target), so API semver-checks don't apply.
 semver_check = false

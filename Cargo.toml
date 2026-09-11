@@ -6,7 +6,6 @@ description = "Real-time terminal dashboard for beads (bd) task-tracking project
 license = "MIT"
 repository = "https://github.com/caretak3r/bdw"
 readme = "README.md"
-publish = false
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time"] }
