@@ -1,52 +1,90 @@
 name: Release-plz
 
-# Fully automatic semantic-versioning pipeline:
-#   1. release-plz-pr opens/updates a PR bumping Cargo.toml + CHANGELOG.md
-#      from Conventional Commits merged to main, then auto-merges it
-#      immediately (repo has "Allow auto-merge" enabled, no required
-#      status checks configured, so there is nothing to wait on).
-#   2. That merge is itself a push to main, which re-triggers this
-#      workflow. release-plz-release now sees a version bump with no
-#      matching git tag, so it cuts the tag + GitHub Release.
-#   3. build-binaries fans out once the release exists and attaches
+# Fully automatic semantic-versioning pipeline, gated on CI passing on main:
+#   1. Triggers only after the CI workflow (fmt/clippy/test) finishes
+#      successfully on main — a broken build/test never gets released.
+#   2. `release-plz update` computes the next version + CHANGELOG.md entry
+#      from Conventional Commits and commits it straight to main. (A PR +
+#      auto-merge round trip was tried first, but a merge performed with
+#      GITHUB_TOKEN never re-triggers workflows on GitHub, so the follow-up
+#      release step would never run. Committing directly in the same job
+#      sidesteps that limitation entirely — no PAT required.)
+#   3. `release-plz release` cuts the git tag + GitHub Release for that
+#      version.
+#   4. build-binaries fans out once the release exists and attaches
 #      prebuilt binaries for macOS (arm64/x86_64) and Linux (x86_64).
-# No manual `git tag` or release step ever needed.
+# No manual `git tag`, PR review, or release step is ever needed.
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
 
 jobs:
-  release-plz-release:
-    name: Release-plz release
+  release:
+    name: Release
     runs-on: ubuntu-latest
-    if: github.repository_owner == 'caretak3r'
+    if: github.repository_owner == 'caretak3r' && github.event.workflow_run.conclusion == 'success'
     permissions:
       contents: write
-      pull-requests: read
     outputs:
-      releases_created: ${{ steps.release-plz.outputs.releases_created }}
-      tag: ${{ steps.release-plz.outputs.releases_created == 'true' && fromJSON(steps.release-plz.outputs.releases)[0].tag || '' }}
+      released: ${{ steps.release.outputs.released }}
+      tag: ${{ steps.release.outputs.tag }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
-          persist-credentials: false
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-      - name: Run release-plz release
-        id: release-plz
-        uses: release-plz/action@v0.5
-        with:
-          command: release
+      - name: Install release-plz
+        uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall release-plz@0.3.165 --no-confirm --force
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Bump version and changelog
+        id: update
+        run: |
+          set -euo pipefail
+          release-plz update
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Commit version bump
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          git add -A
+          git commit -m "chore: release v${version}"
+          git push origin HEAD:main
+      - name: Cut release
+        id: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          output=$(release-plz release --git-token "$GITHUB_TOKEN" -o json)
+          echo "release output: $output"
+          releases=$(echo "$output" | jq -c '.releases')
+          count=$(echo "$releases" | jq 'length')
+          if [ "$count" != "0" ]; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$(echo "$releases" | jq -r '.[0].tag')" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
 
   build-binaries:
     name: Build binaries (${{ matrix.target }})
-    needs: release-plz-release
-    if: needs.release-plz-release.outputs.releases_created == 'true'
+    needs: release
+    if: needs.release.outputs.released == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -64,7 +102,7 @@ jobs:
       - name: Checkout release tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.release-plz-release.outputs.tag }}
+          ref: ${{ needs.release.outputs.tag }}
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -78,7 +116,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          name="bdw-${{ needs.release-plz-release.outputs.tag }}-${{ matrix.target }}"
+          name="bdw-${{ needs.release.outputs.tag }}-${{ matrix.target }}"
           mkdir -p "$name"
           cp "target/${{ matrix.target }}/release/bdw" "$name/"
           cp README.md LICENSE "$name/"
@@ -87,40 +125,9 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.release-plz-release.outputs.tag }}
+          tag_name: ${{ needs.release.outputs.tag }}
           files: |
             bdw-*.tar.gz
             bdw-*.tar.gz.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  release-plz-pr:
-    name: Release-plz PR
-    runs-on: ubuntu-latest
-    if: github.repository_owner == 'caretak3r'
-    permissions:
-      contents: write
-      pull-requests: write
-    concurrency:
-      group: release-plz-${{ github.ref }}
-      cancel-in-progress: false
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run release-plz release-pr
-        id: release-plz
-        uses: release-plz/action@v0.5
-        with:
-          command: release-pr
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Auto-merge release PR
-        if: steps.release-plz.outputs.prs_created == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr merge --auto --merge "${{ fromJSON(steps.release-plz.outputs.pr).number }}"

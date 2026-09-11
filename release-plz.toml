@@ -4,3 +4,5 @@
 # of querying the cargo registry (which would never find this package).
 git_only = true
 publish = false
+# Binary-only crate (no [lib] target), so API semver-checks don't apply.
+semver_check = false
