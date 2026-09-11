@@ -1,0 +1,126 @@
+name: Release-plz
+
+# Fully automatic semantic-versioning pipeline:
+#   1. release-plz-pr opens/updates a PR bumping Cargo.toml + CHANGELOG.md
+#      from Conventional Commits merged to main, then auto-merges it
+#      immediately (repo has "Allow auto-merge" enabled, no required
+#      status checks configured, so there is nothing to wait on).
+#   2. That merge is itself a push to main, which re-triggers this
+#      workflow. release-plz-release now sees a version bump with no
+#      matching git tag, so it cuts the tag + GitHub Release.
+#   3. build-binaries fans out once the release exists and attaches
+#      prebuilt binaries for macOS (arm64/x86_64) and Linux (x86_64).
+# No manual `git tag` or release step ever needed.
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'caretak3r'
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+      tag: ${{ steps.release-plz.outputs.releases_created == 'true' && fromJSON(steps.release-plz.outputs.releases)[0].tag || '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz release
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-binaries:
+    name: Build binaries (${{ matrix.target }})
+    needs: release-plz-release
+    if: needs.release-plz-release.outputs.releases_created == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-plz-release.outputs.tag }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="bdw-${{ needs.release-plz-release.outputs.tag }}-${{ matrix.target }}"
+          mkdir -p "$name"
+          cp "target/${{ matrix.target }}/release/bdw" "$name/"
+          cp README.md LICENSE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release-plz-release.outputs.tag }}
+          files: |
+            bdw-*.tar.gz
+            bdw-*.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'caretak3r'
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz release-pr
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Auto-merge release PR
+        if: steps.release-plz.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --auto --merge "${{ fromJSON(steps.release-plz.outputs.pr).number }}"
