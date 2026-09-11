@@ -29,6 +29,18 @@ Full interaction (grouping toggle, detail overlay, live events feed):
 
 ![bdw demo](docs/screenshots/board.gif)
 
+### Themes
+
+`t` cycles through nine terminal-familiar palettes, persisted to `~/.config/bdw/theme`:
+
+| | | |
+| --- | --- | --- |
+| Catppuccin Mocha | Tokyo Night | Rosé Pine |
+| ![Catppuccin Mocha](docs/screenshots/theme-catppuccin-mocha.png) | ![Tokyo Night](docs/screenshots/theme-tokyo-night.png) | ![Rosé Pine](docs/screenshots/theme-rose-pine.png) |
+| Everforest | Solarized Light | Rosé Pine Dawn |
+| ![Everforest](docs/screenshots/theme-everforest.png) | ![Solarized Light](docs/screenshots/theme-solarized-light.png) | ![Rosé Pine Dawn](docs/screenshots/theme-rose-pine-dawn.png) |
+
+
 ## Features
 
 - **Live updates** — watches `.beads/` via `notify`, debounces bursts, and never invokes `bd` more than once a second.
@@ -94,9 +106,9 @@ This project dogfoods itself — its own `.beads/` directory is a real `bd` proj
 
 Releases are fully automatic (see [`.github/workflows/release-plz.yml`](.github/workflows/release-plz.yml)):
 
-1. Every push to `main` is built and tested across Linux and macOS.
-2. [`release-plz`](https://release-plz.dev) inspects commits since the last release; if any are semver-relevant ([Conventional Commits](https://www.conventionalcommits.org/)), it opens a PR bumping `Cargo.toml` and `CHANGELOG.md`, then auto-merges it.
-3. That merge triggers the pipeline again, `release-plz` cuts the git tag and GitHub Release, and prebuilt binaries are attached automatically.
+1. Every push to `main` is built and tested across Linux and macOS (`ci.yml`).
+2. When that CI run succeeds on `main`, a `workflow_run`-triggered job (`release-plz.yml`) runs [`release-plz`](https://release-plz.dev), which inspects commits since the last release. If any are semver-relevant ([Conventional Commits](https://www.conventionalcommits.org/)), it commits a `Cargo.toml`/`CHANGELOG.md` bump straight to `main` and cuts the git tag and GitHub Release in the same run.
+3. The new tag triggers `build-binaries`, which cross-compiles and attaches prebuilt binaries to the release.
 
 No manual `git tag` or release step is ever required. `fix:` commits bump patch, `feat:` bumps minor, `feat!:`/`BREAKING CHANGE:` bumps major.
 
