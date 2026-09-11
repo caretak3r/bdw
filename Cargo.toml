@@ -2,6 +2,11 @@
 name = "bdw"
 version = "0.1.0"
 edition = "2021"
+description = "Real-time terminal dashboard for beads (bd) task-tracking projects"
+license = "MIT"
+repository = "https://github.com/caretak3r/bdw"
+readme = "README.md"
+publish = false
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time"] }
